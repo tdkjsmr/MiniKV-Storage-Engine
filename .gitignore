@@ -1,0 +1,27 @@
+# Build products
+/build/
+/build-*/
+/cmake-build-*/
+/bin/
+/lib/
+/Testing/
+/compile_commands.json
+
+# Runtime database files
+/*.wal
+/*.sst
+/MANIFEST*
+/CURRENT
+
+# Local-only notes and generated reports
+/.private/
+/docs/
+/benchmark-results/
+
+# Editor and operating-system files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.DS_Store

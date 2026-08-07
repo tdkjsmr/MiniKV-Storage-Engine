@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address, undefined]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          options=()
+          if [[ "${{ matrix.sanitizer }}" == "address" ]]; then
+            options+=("-DMINIKV_ENABLE_ASAN=ON")
+          elif [[ "${{ matrix.sanitizer }}" == "undefined" ]]; then
+            options+=("-DMINIKV_ENABLE_UBSAN=ON")
+          fi
+          cmake -S . -B "build-${{ matrix.sanitizer }}" -DCMAKE_BUILD_TYPE=Debug "${options[@]}"
+
+      - name: Build
+        run: cmake --build "build-${{ matrix.sanitizer }}" --parallel 2
+
+      - name: Test
+        run: ctest --test-dir "build-${{ matrix.sanitizer }}" --output-on-failure
