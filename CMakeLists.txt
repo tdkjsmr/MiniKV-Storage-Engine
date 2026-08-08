@@ -49,8 +49,12 @@ endfunction()
 
 add_library(
     minikv
+    src/coding.cpp
+    src/file.cpp
     src/memtable.cpp
     src/status.cpp
+    src/wal.cpp
+    src/write_path.cpp
 )
 add_library(minikv::minikv ALIAS minikv)
 
@@ -70,4 +74,19 @@ if(MINIKV_BUILD_TESTS)
     minikv_set_target_options(minikv_memtable_test)
 
     add_test(NAME memtable COMMAND minikv_memtable_test)
+
+    add_executable(minikv_coding_test tests/coding_test.cpp)
+    target_link_libraries(minikv_coding_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_coding_test)
+    add_test(NAME coding COMMAND minikv_coding_test)
+
+    add_executable(minikv_wal_test tests/wal_test.cpp)
+    target_link_libraries(minikv_wal_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_wal_test)
+    add_test(NAME wal COMMAND minikv_wal_test)
+
+    add_executable(minikv_write_path_test tests/write_path_test.cpp)
+    target_link_libraries(minikv_write_path_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_write_path_test)
+    add_test(NAME write_path COMMAND minikv_write_path_test)
 endif()

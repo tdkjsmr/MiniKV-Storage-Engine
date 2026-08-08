@@ -7,18 +7,73 @@ correctness tests.
 
 ## Current status
 
-V0 establishes the in-memory record semantics and project foundation:
+V1 adds a versioned write-ahead log and a WAL-first in-process write path on
+top of the V0 memory semantics:
 
 - binary-safe, non-empty keys and binary-safe values;
 - configurable key and value size limits;
 - sequence-number-based ordering with stale per-key updates rejected;
 - last-write-wins behavior for the same key;
 - tombstones that prevent an older value from being exposed after deletion;
+- fixed little-endian WAL encoding with an explicit format version;
+- CRC32C protection for record metadata, keys, and values;
+- complete-write handling for `EINTR`, short writes, and zero progress;
+- strict writes that call `fdatasync` before updating the MemTable;
+- explicit asynchronous writes for durability-cost experiments;
+- a failed-state rule that prevents appending after a write or sync error;
 - deterministic random testing against a `std::map` reference model;
+- Golden Bytes, corruption, injected I/O failure, and real POSIX file tests;
 - CMake builds, CTest integration, and ASan/UBSan/TSan build options.
 
-Persistence is not implemented in V0. The current code must not be described
-as durable or production-ready.
+V1 does not scan or replay a WAL during startup, so MiniKV cannot reopen a
+database yet. Directory synchronization for newly created files and complete
+crash recovery are also not part of V1. These limitations are addressed by
+the recovery and file-publication phases; the current code must not be
+described as a complete durable database or as production-ready.
+
+## WAL format version 1
+
+Each record has a fixed 32-byte header followed by the key and value:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic bytes `MKVW` |
+| 4 | 1 | Format version |
+| 5 | 1 | Record type: value or deletion |
+| 6 | 2 | Header size |
+| 8 | 4 | Total record size |
+| 12 | 8 | Sequence number |
+| 20 | 4 | Key size |
+| 24 | 4 | Value size |
+| 28 | 4 | CRC32C |
+| 32 | variable | Key bytes followed by value bytes |
+
+All integers are little-endian. The checksum covers header bytes `[0, 28)`
+and the complete payload, so changes to the type, sequence number, lengths,
+key, or value are detected. A deletion record must have an empty value.
+
+## Write and durability semantics
+
+The V1 write path performs the following steps:
+
+```text
+validate input
+    -> allocate a sequence number
+    -> encode and completely append one WAL record
+    -> fdatasync in strict mode
+    -> update the MemTable
+```
+
+Strict mode is the default. If append or `fdatasync` fails, the operation
+returns an I/O error and is not made visible in the MemTable. The writer then
+rejects later writes because continuing after a partial tail could turn it
+into corruption in the middle of the WAL. A failed sync may still leave a
+complete but unconfirmed record in the operating-system cache; its sequence
+number is therefore never reused.
+
+Asynchronous mode skips `fdatasync`. It is useful for controlled experiments,
+but process or machine failure may lose recently acknowledged writes. Results
+from strict and asynchronous modes must be reported separately.
 
 ## Build and test
 

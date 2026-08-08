@@ -13,7 +13,7 @@ jobs:
         sanitizer: [none, address, undefined]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure
         shell: bash
