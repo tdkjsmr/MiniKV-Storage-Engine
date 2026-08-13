@@ -38,11 +38,25 @@ struct WalDecodeResult {
     WalRecord record;
 };
 
+struct WalHeaderDecodeResult {
+    Status status;
+    ValueType type = ValueType::kValue;
+    std::uint32_t record_size = 0;
+    std::uint64_t sequence = 0;
+    std::uint32_t key_size = 0;
+    std::uint32_t value_size = 0;
+    std::uint32_t checksum = 0;
+};
+
 Status ValidateWalRecord(const WalRecord& record, const Options& options);
 Status EncodeWalRecord(
     const WalRecord& record,
     const Options& options,
     std::string* destination
+);
+[[nodiscard]] WalHeaderDecodeResult DecodeWalRecordHeader(
+    std::string_view input,
+    const Options& options
 );
 [[nodiscard]] WalDecodeResult DecodeWalRecord(
     std::string_view input,

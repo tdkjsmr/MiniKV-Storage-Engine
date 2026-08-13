@@ -122,27 +122,28 @@ Status EncodeWalRecord(
     return Status::Ok();
 }
 
-WalDecodeResult DecodeWalRecord(std::string_view input, const Options& options) {
+WalHeaderDecodeResult DecodeWalRecordHeader(
+    std::string_view input,
+    const Options& options
+) {
     if (input.size() < kWalHeaderSize) {
         return {
             Status::Incomplete("WAL record header is incomplete"),
-            0,
-            {},
         };
     }
 
     if (!std::equal(kWalMagic.begin(), kWalMagic.end(), input.begin())) {
-        return {Corrupt("magic does not match"), 0, {}};
+        return {Corrupt("magic does not match")};
     }
 
     const auto version = static_cast<std::uint8_t>(input[kVersionOffset]);
     if (version != kWalFormatVersion) {
-        return {Corrupt("format version is unsupported"), 0, {}};
+        return {Corrupt("format version is unsupported")};
     }
 
     const auto type = static_cast<ValueType>(static_cast<std::uint8_t>(input[kTypeOffset]));
     if (!IsKnownType(type)) {
-        return {Corrupt("record type is invalid"), 0, {}};
+        return {Corrupt("record type is invalid")};
     }
 
     std::uint16_t header_size = 0;
@@ -157,50 +158,70 @@ WalDecodeResult DecodeWalRecord(std::string_view input, const Options& options) 
         !DecodeFixed32(input.substr(kKeySizeOffset), &key_size) ||
         !DecodeFixed32(input.substr(kValueSizeOffset), &value_size) ||
         !DecodeFixed32(input.substr(kChecksumOffset), &expected_checksum)) {
-        return {Corrupt("fixed header fields cannot be decoded"), 0, {}};
+        return {Corrupt("fixed header fields cannot be decoded")};
     }
 
     if (header_size != kWalHeaderSize) {
-        return {Corrupt("header size is invalid"), 0, {}};
+        return {Corrupt("header size is invalid")};
     }
     if (sequence == 0) {
-        return {Corrupt("sequence number is zero"), 0, {}};
+        return {Corrupt("sequence number is zero")};
     }
 
     const auto length_validation = ValidateLengths(key_size, value_size, type, options);
     if (!length_validation.ok()) {
-        return {Corrupt(length_validation.message()), 0, {}};
+        return {Corrupt(length_validation.message())};
     }
 
     const auto key_size_in_memory = static_cast<std::size_t>(key_size);
     const auto value_size_in_memory = static_cast<std::size_t>(value_size);
     if (key_size_in_memory >
         std::numeric_limits<std::size_t>::max() - value_size_in_memory) {
-        return {Corrupt("payload size overflows size_t"), 0, {}};
+        return {Corrupt("payload size overflows size_t")};
     }
     const std::size_t payload_size = key_size_in_memory + value_size_in_memory;
     const std::size_t calculated_size = kWalHeaderSize + payload_size;
     if (record_size != calculated_size) {
-        return {Corrupt("record size does not match key and value lengths"), 0, {}};
+        return {Corrupt("record size does not match key and value lengths")};
     }
+
+    return {
+        Status::Ok(),
+        type,
+        record_size,
+        sequence,
+        key_size,
+        value_size,
+        expected_checksum,
+    };
+}
+
+WalDecodeResult DecodeWalRecord(std::string_view input, const Options& options) {
+    const auto header = DecodeWalRecordHeader(input, options);
+    if (!header.status.ok()) {
+        return {header.status, 0, {}};
+    }
+
+    const auto calculated_size = static_cast<std::size_t>(header.record_size);
     if (input.size() < calculated_size) {
         return {Status::Incomplete("WAL record payload is incomplete"), 0, {}};
     }
 
+    const auto payload_size = calculated_size - kWalHeaderSize;
     const std::string_view payload = input.substr(kWalHeaderSize, payload_size);
     const std::uint32_t actual_checksum = RecordChecksum(
         input.substr(0, kChecksumOffset),
         payload
     );
-    if (actual_checksum != expected_checksum) {
+    if (actual_checksum != header.checksum) {
         return {Corrupt("checksum mismatch"), 0, {}};
     }
 
     WalRecord record;
-    record.type = type;
-    record.sequence = sequence;
-    record.key.assign(payload.substr(0, key_size));
-    record.value.assign(payload.substr(key_size, value_size));
+    record.type = header.type;
+    record.sequence = header.sequence;
+    record.key.assign(payload.substr(0, header.key_size));
+    record.value.assign(payload.substr(header.key_size, header.value_size));
     return {Status::Ok(), calculated_size, std::move(record)};
 }
 

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -52,6 +52,7 @@ add_library(
     src/coding.cpp
     src/file.cpp
     src/memtable.cpp
+    src/recovery.cpp
     src/status.cpp
     src/wal.cpp
     src/write_path.cpp
@@ -89,4 +90,9 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_write_path_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_write_path_test)
     add_test(NAME write_path COMMAND minikv_write_path_test)
+
+    add_executable(minikv_recovery_test tests/recovery_test.cpp)
+    target_link_libraries(minikv_recovery_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_recovery_test)
+    add_test(NAME recovery COMMAND minikv_recovery_test)
 endif()

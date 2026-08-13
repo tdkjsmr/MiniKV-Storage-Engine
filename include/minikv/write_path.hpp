@@ -2,24 +2,31 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 
 #include "minikv/file.hpp"
 #include "minikv/memtable.hpp"
 #include "minikv/options.hpp"
+#include "minikv/recovery.hpp"
 #include "minikv/status.hpp"
 #include "minikv/wal.hpp"
 
 namespace minikv {
 
-// WritePath is the V1 write coordinator. It deliberately exposes only an
-// in-process API; Open and crash recovery are added in V2.
+// WritePath coordinates WAL-first writes and the recovered in-memory view.
 class WritePath {
 public:
     static Status Create(
         Options options,
         std::unique_ptr<WritableFile> wal_file,
         std::unique_ptr<WritePath>* output
+    );
+    static Status Open(
+        std::string path,
+        Options options,
+        std::unique_ptr<WritePath>* output,
+        WalRecoveryResult* recovery_result
     );
 
     Status Put(
@@ -37,6 +44,12 @@ public:
 
 private:
     WritePath(Options options, std::unique_ptr<WritableFile> wal_file);
+    WritePath(
+        Options options,
+        std::unique_ptr<WritableFile> wal_file,
+        MemTable recovered_memtable,
+        std::uint64_t last_sequence
+    );
 
     Status Write(
         ValueType type,

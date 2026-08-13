@@ -7,8 +7,7 @@ correctness tests.
 
 ## Current status
 
-V1 adds a versioned write-ahead log and a WAL-first in-process write path on
-top of the V0 memory semantics:
+V2 closes the single-WAL crash-recovery loop on top of the V1 write path:
 
 - binary-safe, non-empty keys and binary-safe values;
 - configurable key and value size limits;
@@ -21,15 +20,23 @@ top of the V0 memory semantics:
 - strict writes that call `fdatasync` before updating the MemTable;
 - explicit asynchronous writes for durability-cost experiments;
 - a failed-state rule that prevents appending after a write or sync error;
+- startup scanning and replay into a fresh MemTable;
+- recovery of the maximum sequence number before new writes are accepted;
+- exact truncation of an incomplete final record followed by `fdatasync`;
+- hard failure on bad headers, checksums, or non-increasing sequences;
+- transactional recovery outputs: failed replay does not expose partial state;
+- retry handling for `EINTR`, short `pread`, and changing EOF;
 - deterministic random testing against a `std::map` reference model;
-- Golden Bytes, corruption, injected I/O failure, and real POSIX file tests;
+- Golden Bytes, exhaustive tail cuts and record bit flips, injected I/O
+  failures, real POSIX reopen tests, and a `SIGKILL` crash test;
 - CMake builds, CTest integration, and ASan/UBSan/TSan build options.
 
-V1 does not scan or replay a WAL during startup, so MiniKV cannot reopen a
-database yet. Directory synchronization for newly created files and complete
-crash recovery are also not part of V1. These limitations are addressed by
-the recovery and file-publication phases; the current code must not be
-described as a complete durable database or as production-ready.
+V2 can reopen one WAL, restore its logical state, repair a torn final append,
+and continue with the next sequence number. It does not yet provide file
+locking, concurrent `Open`, WAL generations, Flush/SSTable recovery, or
+directory synchronization for a newly created WAL. Those lifecycle guarantees
+arrive with later file-publication phases, so the current code is not a
+complete durable database or production-ready.
 
 ## WAL format version 1
 
@@ -52,7 +59,7 @@ All integers are little-endian. The checksum covers header bytes `[0, 28)`
 and the complete payload, so changes to the type, sequence number, lengths,
 key, or value are detected. A deletion record must have an empty value.
 
-## Write and durability semantics
+## Write, recovery, and durability semantics
 
 The V1 write path performs the following steps:
 
@@ -74,6 +81,18 @@ number is therefore never reused.
 Asynchronous mode skips `fdatasync`. It is useful for controlled experiments,
 but process or machine failure may lose recently acknowledged writes. Results
 from strict and asynchronous modes must be reported separately.
+
+On `WritePath::Open`, V2 scans from byte zero and requires sequence numbers to
+be globally strictly increasing. Each complete record must have a valid header,
+internally consistent lengths, and a matching CRC32C before it is replayed.
+The recovered maximum sequence becomes the write path's sequence frontier.
+
+Only an incomplete final record is repairable. Recovery truncates the file to
+the last verified record boundary and calls `fdatasync` before returning
+success. A malformed header, checksum mismatch, or sequence-order violation is
+reported as corruption and leaves the WAL unchanged. Replay is built in a
+temporary MemTable, so callers never observe a partially recovered state after
+an error.
 
 ## Build and test
 

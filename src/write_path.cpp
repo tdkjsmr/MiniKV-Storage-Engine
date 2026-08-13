@@ -23,8 +23,69 @@ Status WritePath::Create(
     return Status::Ok();
 }
 
+Status WritePath::Open(
+    std::string path,
+    Options options,
+    std::unique_ptr<WritePath>* output,
+    WalRecoveryResult* recovery_result
+) {
+    if (output == nullptr || recovery_result == nullptr) {
+        return Status::InvalidArgument("WritePath Open outputs must not be null");
+    }
+    output->reset();
+    *recovery_result = {};
+    if (path.empty()) {
+        return Status::InvalidArgument("WritePath WAL path must not be empty");
+    }
+
+    std::unique_ptr<RecoveryFile> recovery_file;
+    auto open_status = PosixRecoveryFile::Open(path, &recovery_file);
+    if (!open_status.ok()) {
+        return open_status;
+    }
+
+    MemTable recovered_memtable(options);
+    WalRecoveryResult recovered_result;
+    const auto recovery_status = RecoverWal(
+        *recovery_file,
+        options,
+        &recovered_memtable,
+        &recovered_result
+    );
+    if (!recovery_status.ok()) {
+        return recovery_status;
+    }
+    recovery_file.reset();
+
+    std::unique_ptr<WritableFile> wal_file;
+    open_status = PosixWritableFile::OpenAppend(path, &wal_file);
+    if (!open_status.ok()) {
+        return open_status;
+    }
+
+    output->reset(new WritePath(
+        options,
+        std::move(wal_file),
+        std::move(recovered_memtable),
+        recovered_result.max_sequence
+    ));
+    *recovery_result = recovered_result;
+    return Status::Ok();
+}
+
 WritePath::WritePath(Options options, std::unique_ptr<WritableFile> wal_file)
     : options_(options), wal_(options, std::move(wal_file)), memtable_(options) {}
+
+WritePath::WritePath(
+    Options options,
+    std::unique_ptr<WritableFile> wal_file,
+    MemTable recovered_memtable,
+    std::uint64_t last_sequence
+)
+    : options_(options),
+      wal_(options, std::move(wal_file)),
+      memtable_(std::move(recovered_memtable)),
+      last_sequence_(last_sequence) {}
 
 Status WritePath::Put(
     std::string_view key,
