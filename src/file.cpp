@@ -160,6 +160,35 @@ Status PosixWritableFile::OpenAppend(
     return Status::Ok();
 }
 
+Status PosixWritableFile::OpenTruncate(
+    std::string path,
+    std::unique_ptr<WritableFile>* output
+) {
+    if (output == nullptr) {
+        return Status::InvalidArgument("file output pointer must not be null");
+    }
+    output->reset();
+    if (path.empty()) {
+        return Status::InvalidArgument("file path must not be empty");
+    }
+
+    int file_descriptor = -1;
+    do {
+        file_descriptor = ::open(
+            path.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+            static_cast<mode_t>(0644)
+        );
+    } while (file_descriptor < 0 && errno == EINTR);
+
+    if (file_descriptor < 0) {
+        return Status::IOError(IOErrorMessage("open", path, errno));
+    }
+
+    output->reset(new PosixWritableFile(file_descriptor, std::move(path)));
+    return Status::Ok();
+}
+
 PosixWritableFile::PosixWritableFile(int file_descriptor, std::string path)
     : file_descriptor_(file_descriptor), path_(std::move(path)) {}
 

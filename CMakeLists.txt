@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -50,10 +50,13 @@ endfunction()
 add_library(
     minikv
     src/coding.cpp
+    src/database.cpp
     src/file.cpp
+    src/flush.cpp
     src/memtable.cpp
     src/recovery.cpp
     src/status.cpp
+    src/table.cpp
     src/wal.cpp
     src/write_path.cpp
 )
@@ -95,4 +98,14 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_recovery_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_recovery_test)
     add_test(NAME recovery COMMAND minikv_recovery_test)
+
+    add_executable(minikv_table_flush_test tests/table_flush_test.cpp)
+    target_link_libraries(minikv_table_flush_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_table_flush_test)
+    add_test(NAME table_flush COMMAND minikv_table_flush_test)
+
+    add_executable(minikv_database_test tests/database_test.cpp)
+    target_link_libraries(minikv_database_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_database_test)
+    add_test(NAME database COMMAND minikv_database_test)
 endif()

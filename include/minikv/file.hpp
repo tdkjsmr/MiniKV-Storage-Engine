@@ -83,6 +83,10 @@ public:
         std::string path,
         std::unique_ptr<WritableFile>* output
     );
+    static Status OpenTruncate(
+        std::string path,
+        std::unique_ptr<WritableFile>* output
+    );
 
     ~PosixWritableFile() override;
 

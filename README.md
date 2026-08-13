@@ -7,7 +7,8 @@ correctness tests.
 
 ## Current status
 
-V2 closes the single-WAL crash-recovery loop on top of the V1 write path:
+V3 adds MemTable generations and a foreground, crash-safe Flush lifecycle on
+top of V2 recovery:
 
 - binary-safe, non-empty keys and binary-safe values;
 - configurable key and value size limits;
@@ -26,17 +27,32 @@ V2 closes the single-WAL crash-recovery loop on top of the V1 write path:
 - hard failure on bad headers, checksums, or non-increasing sequences;
 - transactional recovery outputs: failed replay does not expose partial state;
 - retry handling for `EINTR`, short `pread`, and changing EOF;
+- a configurable MemTable byte threshold;
+- one active Mutable MemTable and at most one pending Immutable MemTable;
+- one WAL file per MemTable generation;
+- a checksummed, sorted, read-only sequential table format;
+- Flush publication ordered as temporary write, file sync, rename, and
+  directory sync;
+- old-WAL removal only after its table is published and the directory entry is
+  durable;
+- layered reads through Mutable, Immutable, and flushed tables from newest to
+  oldest;
+- same-process Flush retry and restart recovery after every injected
+  publication-step failure;
 - deterministic random testing against a `std::map` reference model;
 - Golden Bytes, exhaustive tail cuts and record bit flips, injected I/O
   failures, real POSIX reopen tests, and a `SIGKILL` crash test;
 - CMake builds, CTest integration, and ASan/UBSan/TSan build options.
 
-V2 can reopen one WAL, restore its logical state, repair a torn final append,
-and continue with the next sequence number. It does not yet provide file
-locking, concurrent `Open`, WAL generations, Flush/SSTable recovery, or
-directory synchronization for a newly created WAL. Those lifecycle guarantees
-arrive with later file-publication phases, so the current code is not a
-complete durable database or production-ready.
+The V3 `Database` API opens a directory, validates its published tables,
+replays at most one active WAL, removes a WAL only when the matching table is
+valid, and continues with the next generation and sequence number.
+
+V3 intentionally performs Flush in the foreground and loads every sequential
+table into memory during `Open`. It does not yet have sparse indexes, block
+checksums, a Footer, a Manifest, file locking, concurrent `Open`, background
+work, or Compaction. Directory scanning is only the pre-Manifest bootstrap
+rule. These limitations keep V3 testable but mean it is not production-ready.
 
 ## WAL format version 1
 
@@ -93,6 +109,70 @@ success. A malformed header, checksum mismatch, or sequence-order violation is
 reported as corruption and leaves the WAL unchanged. Replay is built in a
 temporary MemTable, so callers never observe a partially recovered state after
 an error.
+
+## MemTable generations and Flush
+
+The V3 `Database` coordinator assigns each MemTable its own 20-digit file
+number:
+
+```text
+00000000000000000001.wal
+    -> Mutable generation 1 reaches its configured byte limit
+    -> Immutable generation 1
+    -> 00000000000000000001.sst.tmp
+    -> fdatasync(table)
+    -> rename to 00000000000000000001.sst
+    -> fsync(database directory)
+    -> remove generation 1 WAL
+    -> fsync(database directory)
+    -> open and publish generation 2 WAL
+```
+
+The old WAL remains authoritative until the final table name is durable. If
+table creation, write, sync, rename, directory sync, or WAL removal fails, the
+Immutable MemTable remains readable and `Flush()` can be retried. Restart can
+recover from the retained WAL or, if rename completed, validate the published
+table before removing the redundant WAL.
+
+An automatic Flush happens after the threshold-crossing write has already
+completed its WAL and MemTable steps. If that Flush fails, `Put` or `Delete`
+returns the maintenance I/O error, but that record remains readable and
+recoverable. Callers must not interpret this specific error as proof that the
+record is absent; they may retry `Flush()` or reopen the database. New writes
+first retry the pending foreground Flush.
+
+The read order is:
+
+```text
+Mutable -> pending Immutable -> flushed tables newest to oldest
+```
+
+A tombstone stops the search and becomes user-visible `NotFound`; lookup
+never continues into an older table where a deleted value might still exist.
+
+## Sequential table format version 1
+
+V3 uses a deliberately minimal format so file lifecycle correctness can be
+tested before V4 adds blocks and an index:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic bytes `MKST` |
+| 4 | 1 | Format version |
+| 5 | 1 | Reserved |
+| 6 | 2 | Header size |
+| 8 | 8 | MemTable generation |
+| 16 | 8 | Record count |
+| 24 | 4 | Payload size |
+| 28 | 4 | CRC32C |
+| 32 | variable | WAL-format records ordered by user key |
+
+The table checksum covers header bytes `[0, 28)` and the entire payload.
+Every embedded record also retains its WAL CRC32C. `Open` rejects malformed,
+trailing, unsorted, generation-mismatched, or sequence-overlapping tables.
+`Open` currently decodes every complete table into an in-memory ordered map;
+point lookup does not yet use an on-disk index. V4 replaces this bootstrap
+reader with data blocks, a sparse index, and a fixed Footer.
 
 ## Build and test
 
@@ -153,8 +233,8 @@ implementation and tests land:
 1. V0: memory semantics, sequence numbers, tombstones, and reference-model tests.
 2. V1: versioned WAL encoding, complete writes, checksums, and sync policy.
 3. V2: WAL replay, truncated-tail handling, corruption detection, and crash tests.
-4. V3: MemTable generations and safe Flush.
-5. V4: immutable SSTable format, sparse index, checksums, and point lookup.
+4. V3: MemTable generations, per-generation WALs, and safe foreground Flush.
+5. V4: block-oriented SSTables, sparse indexes, checksums, and disk point lookup.
 6. V5: Manifest and atomic Version publication.
 7. V6: Bloom filters and read-path statistics.
 8. V7: semantics-preserving L0-to-L1 Compaction.
@@ -169,8 +249,8 @@ implementation and tests land:
 - A tombstone remains visible to internal lookup until it is safe to discard;
   otherwise an older value could reappear.
 - Storage errors and corruption must never be converted into `NotFound`.
-- Future WAL files may be removed only after their records are covered by a
-  safely published SSTable.
+- A generation WAL may be removed only after its records are covered by a
+  validated table whose rename and directory entry have been synchronized.
 - Future Manifest versions may reference only existing, validated files.
 
 ## Scope
