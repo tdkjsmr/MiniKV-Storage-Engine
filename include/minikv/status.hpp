@@ -12,6 +12,7 @@ enum class StatusCode {
     kInvalidArgument,
     kIOError,
     kCorruption,
+    kVersionMismatch,
     kClosed,
 };
 
@@ -25,6 +26,7 @@ public:
     static Status InvalidArgument(std::string message);
     static Status IOError(std::string message);
     static Status Corruption(std::string message);
+    static Status VersionMismatch(std::string message);
     static Status Closed(std::string message = {});
 
     [[nodiscard]] bool ok() const noexcept { return code_ == StatusCode::kOk; }
@@ -33,6 +35,9 @@ public:
     }
     [[nodiscard]] bool IsIncomplete() const noexcept {
         return code_ == StatusCode::kIncomplete;
+    }
+    [[nodiscard]] bool IsVersionMismatch() const noexcept {
+        return code_ == StatusCode::kVersionMismatch;
     }
     [[nodiscard]] StatusCode code() const noexcept { return code_; }
     [[nodiscard]] const std::string& message() const noexcept { return message_; }

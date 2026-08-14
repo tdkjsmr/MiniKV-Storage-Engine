@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.4.0
+    VERSION 0.5.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -50,10 +50,12 @@ endfunction()
 add_library(
     minikv
     src/coding.cpp
+    src/database_lock.cpp
     src/database.cpp
     src/file.cpp
     src/flush.cpp
     src/memtable.cpp
+    src/manifest.cpp
     src/recovery.cpp
     src/status.cpp
     src/table.cpp
@@ -112,4 +114,9 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_database_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_database_test)
     add_test(NAME database COMMAND minikv_database_test)
+
+    add_executable(minikv_manifest_test tests/manifest_test.cpp)
+    target_link_libraries(minikv_manifest_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_manifest_test)
+    add_test(NAME manifest COMMAND minikv_manifest_test)
 endif()

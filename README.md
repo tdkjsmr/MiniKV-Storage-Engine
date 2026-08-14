@@ -7,8 +7,9 @@ reproducible correctness tests.
 
 ## Current status
 
-V4 adds block-oriented SSTables and indexed disk point lookup on top of the V3
-MemTable-generation and crash-safe Flush lifecycle:
+V5 adds an authoritative MANIFEST, atomic Version publication, explicit storage
+format identity, and an exclusive data-directory lock on top of the V4 indexed
+SSTable read path:
 
 - binary-safe keys and values with configurable size limits;
 - monotonically increasing sequence numbers and last-write-wins semantics;
@@ -19,6 +20,19 @@ MemTable-generation and crash-safe Flush lifecycle:
 - one WAL and, after Flush, one immutable SSTable per generation;
 - crash-safe publication ordered as temporary write, file sync, rename, and
   directory sync;
+- immutable `Version` snapshots changed through validated `VersionEdit`s;
+- an atomically replaced, CRC32C-protected MANIFEST that records the live
+  SSTable set, levels, key and sequence bounds, next file number, and sequence
+  frontier;
+- startup driven only by MANIFEST references rather than inferred directory
+  contents;
+- rejection of missing referenced files and metadata disagreements as hard
+  corruption;
+- cleanup of unreferenced SSTables and interrupted temporary files;
+- an explicit directory storage-format version and `VersionMismatch` status
+  for unsupported or pre-MANIFEST directories;
+- a process-lifetime `LOCK` file acquired with non-blocking `flock`, preventing
+  two engine instances from mutating the same directory;
 - block-oriented, key-sorted SSTables with per-record and per-block checksums;
 - a sparse index containing each data block's first key, offset, and length;
 - a fixed-size Footer with 64-bit region offsets and sequence summaries;
@@ -33,13 +47,14 @@ MemTable-generation and crash-safe Flush lifecycle:
 - reads across Mutable, Immutable, and multiple SSTables, with the greatest
   sequence number winning and tombstones converted to user-visible NotFound;
 - a read-only `minikv_sstable_dump` diagnostic utility;
-- deterministic random-model tests, exhaustive one-byte SSTable corruption,
-  injected publication failures, restart tests, and sanitizer build options.
+- deterministic random-model tests, exhaustive one-byte SSTable and MANIFEST
+  corruption, per-stage publication failures, lock-conflict tests, restart
+  tests, and sanitizer build options.
 
-V4 still uses foreground Flush and directory scanning. It does not yet have a
-Manifest, Bloom filters, Compaction, background work, file locking, concurrent
-`Open`, compression, or a stable on-disk upgrade path. Format-version-1 V3
-SSTables are intentionally rejected by the V4 reader.
+V5 still uses foreground Flush. It does not yet have Bloom filters, Compaction,
+range scans, background work, in-process concurrent calls, compression, or an
+automatic storage-format upgrade path. Unsupported directory formats are
+rejected; migration must be an explicit offline operation.
 
 ## WAL format version 1
 
@@ -97,19 +112,64 @@ Each generation uses a 20-digit file number:
     -> rename to 00000000000000000001.sst
     -> fsync(database directory)
     -> validate the published SSTable
+    -> apply one VersionEdit in memory
+    -> write MANIFEST.tmp and fdatasync it
+    -> rename MANIFEST.tmp to MANIFEST
+    -> fsync(database directory)
+    -> publish the new in-memory Version
     -> remove generation 1 WAL
     -> fsync(database directory)
     -> open generation 2 WAL
 ```
 
-The old WAL remains authoritative until the final table name is durable and
-the published SSTable has passed complete validation. Failed Flush work can be
-retried in process; restart either recovers the retained WAL or validates the
-matching SSTable before removing a redundant WAL.
+The old WAL remains authoritative until the table is durable, validated, and
+referenced by a durable MANIFEST. Failed Flush work can be retried in process.
+After a crash, the old MANIFEST means the retained WAL is replayed and an
+unreferenced table is removed; the new MANIFEST means the table is loaded and
+the redundant old WAL is removed. A half-published in-memory Version is never
+observable.
 
 An automatic Flush happens after the threshold-crossing write has completed
 its WAL and MemTable steps. If maintenance then fails, that record remains
 readable and recoverable even though the call reports an I/O error.
+
+## Directory storage format and MANIFEST version 1
+
+The MANIFEST is the sole authority for the set of live SSTables. It is a full
+immutable Version snapshot. A `VersionEdit` may add and delete files together,
+but publication replaces the snapshot atomically instead of appending a record
+that could leave a torn tail.
+
+The fixed 64-byte header is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic `MKMF` |
+| 4 | 1 | MANIFEST format version `1` |
+| 5 | 1 | Directory storage format version `1` |
+| 6 | 2 | Header size `64` |
+| 8 | 8 | Physical file size |
+| 16 | 8 | Monotonic Version id |
+| 24 | 8 | Next file number |
+| 32 | 8 | Last published sequence number |
+| 40 | 4 | Live-table count |
+| 44 | 4 | Table-record payload size |
+| 48 | 8 | Reserved, must be zero |
+| 56 | 4 | CRC32C of bytes `[0, 56)` and the complete payload |
+| 60 | 4 | Reserved, must be zero |
+
+Each variable table record contains:
+
+```text
+[record size: u32][level: u32][file number: u64][file size: u64]
+[record count: u64][minimum sequence: u64][maximum sequence: u64]
+[minimum key size: u32][maximum key size: u32][key bytes]
+```
+
+All integers are little-endian. Every length and count is validated before it
+controls allocation or slicing. The complete MANIFEST is capped at 64 MiB.
+On `Open`, every referenced table must exist, pass its own checksums, and agree
+with the MANIFEST summaries. Unreferenced SSTables never participate in reads.
 
 ## SSTable format version 2
 
@@ -211,7 +271,8 @@ flowchart LR
     M --> I[Immutable MemTable]
     I --> F[Flush]
     F --> S[Indexed L0 SSTable]
-    S --> C[L0 to L1 Compaction]
+    S --> V[Atomic MANIFEST / Version]
+    V --> C[L0 to L1 Compaction]
 
     R[Get] --> M
     R --> I
@@ -225,13 +286,17 @@ The roadmap is incremental:
 3. V2: WAL replay, tail repair, corruption detection, and crash tests.
 4. V3: MemTable generations, per-generation WALs, and safe foreground Flush.
 5. V4: block-oriented SSTables, sparse indexes, checksums, and disk point lookup.
-6. V5: Manifest and atomic Version publication.
+6. V5: MANIFEST, atomic Version publication, storage identity, and directory
+   locking.
 7. V6: Bloom filters and read-path statistics.
 8. V7: semantics-preserving L0-to-L1 Compaction.
-9. V8: background Flush, single-writer/multi-reader coordination, and shutdown.
-10. V9: model, fault, crash, and concurrency stress testing.
-11. V10: reproducible workloads, latency percentiles, amplification metrics, and
-    one measured optimization cycle.
+9. V8: bounded deterministic range/prefix scans and continuation tokens.
+10. V9: background Flush/Compaction, single-writer/multi-reader coordination,
+    stable scan views, and idempotent shutdown.
+11. V10: model, fault, crash, format-compatibility, fuzz, and concurrency stress
+    testing with stable error categories.
+12. V11: reproducible workloads, latency percentiles, amplification metrics,
+    one measured optimization cycle, and installable package/API stabilization.
 
 ## Core invariants
 
@@ -240,8 +305,12 @@ The roadmap is incremental:
 - Tombstones remain visible internally until they are safe to discard.
 - Storage errors and corruption are never converted into NotFound.
 - Every disk-derived offset and length is validated before it is used.
-- A generation WAL is removed only after a valid, durable table covers it.
-- Future Manifest versions may reference only existing, validated files.
+- A generation WAL is removed only after a valid, durable table is referenced
+  by a durable MANIFEST.
+- Every MANIFEST reference must name an existing, validated file with matching
+  immutable metadata.
+- Files absent from the current Version never participate in reads.
+- At most one process owns a database directory's exclusive `LOCK`.
 
 ## Scope
 

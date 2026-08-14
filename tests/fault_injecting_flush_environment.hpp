@@ -17,6 +17,11 @@ enum class FlushFailurePoint {
     kRename,
     kDirectorySync,
     kRemoveWal,
+    kManifestCreate,
+    kManifestWrite,
+    kManifestFileSync,
+    kManifestRename,
+    kManifestDirectorySync,
 };
 
 class FaultInjectingFlushEnvironment final : public FlushEnvironment {
@@ -30,14 +35,18 @@ private:
             : inner_(std::move(inner)), active_failure_(active_failure) {}
 
         WriteResult WriteSome(std::string_view data) override {
-            if (*active_failure_ == FlushFailurePoint::kWrite) {
+            if (*active_failure_ == FlushFailurePoint::kWrite ||
+                (*active_failure_ == FlushFailurePoint::kManifestWrite &&
+                 IsManifestTemporary(inner_->name()))) {
                 return WriteResult::Error(Status::IOError("injected table write"));
             }
             return inner_->WriteSome(data);
         }
 
         Status Sync() override {
-            if (*active_failure_ == FlushFailurePoint::kFileSync) {
+            if (*active_failure_ == FlushFailurePoint::kFileSync ||
+                (*active_failure_ == FlushFailurePoint::kManifestFileSync &&
+                 IsManifestTemporary(inner_->name()))) {
                 return Status::IOError("injected table sync");
             }
             return inner_->Sync();
@@ -48,6 +57,12 @@ private:
         }
 
     private:
+        static bool IsManifestTemporary(std::string_view path) {
+            constexpr std::string_view suffix = "MANIFEST.tmp";
+            return path.size() >= suffix.size() &&
+                   path.substr(path.size() - suffix.size()) == suffix;
+        }
+
         std::unique_ptr<WritableFile> inner_;
         FlushFailurePoint* active_failure_;
     };
@@ -60,7 +75,10 @@ public:
         const std::string& path,
         std::unique_ptr<WritableFile>* output
     ) override {
-        if (active_failure_ == FlushFailurePoint::kCreate) {
+        const bool manifest =
+            path.size() >= 12 && path.substr(path.size() - 12) == "MANIFEST.tmp";
+        if (active_failure_ == FlushFailurePoint::kCreate ||
+            (active_failure_ == FlushFailurePoint::kManifestCreate && manifest)) {
             return Status::IOError("injected table create");
         }
         std::unique_ptr<WritableFile> inner;
@@ -76,10 +94,17 @@ public:
         const std::string& source,
         const std::string& destination
     ) override {
-        if (active_failure_ == FlushFailurePoint::kRename) {
+        const bool manifest = destination.size() >= 8 &&
+            destination.substr(destination.size() - 8) == "MANIFEST";
+        if (active_failure_ == FlushFailurePoint::kRename ||
+            (active_failure_ == FlushFailurePoint::kManifestRename && manifest)) {
             return Status::IOError("injected table rename");
         }
-        return delegate_.Rename(source, destination);
+        const auto status = delegate_.Rename(source, destination);
+        if (status.ok() && manifest) {
+            manifest_renamed_ = true;
+        }
+        return status;
     }
 
     Status RemoveFile(const std::string& path) override {
@@ -91,7 +116,9 @@ public:
     }
 
     Status SyncDirectory(const std::string& directory) override {
-        if (active_failure_ == FlushFailurePoint::kDirectorySync) {
+        if (active_failure_ == FlushFailurePoint::kDirectorySync ||
+            (active_failure_ == FlushFailurePoint::kManifestDirectorySync &&
+             manifest_renamed_)) {
             return Status::IOError("injected directory sync");
         }
         return delegate_.SyncDirectory(directory);
@@ -100,6 +127,7 @@ public:
 private:
     PosixFlushEnvironment delegate_;
     FlushFailurePoint active_failure_ = FlushFailurePoint::kNone;
+    bool manifest_renamed_ = false;
 };
 
 }  // namespace minikv::test

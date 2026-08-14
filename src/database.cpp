@@ -10,7 +10,9 @@
 #include <utility>
 
 #include "minikv/file.hpp"
+#include "minikv/manifest.hpp"
 #include "minikv/recovery.hpp"
+#include "database_lock.hpp"
 
 namespace minikv {
 namespace {
@@ -53,23 +55,22 @@ bool ParseGenerationFile(
     return true;
 }
 
-Status ValidateTableSequenceOrder(
-    const std::vector<std::unique_ptr<SSTableReader>>& tables,
-    std::uint64_t* max_sequence
+bool ManifestMetadataMatches(
+    const SSTableMetadata& expected,
+    const SSTableMetadata& actual
 ) {
-    if (max_sequence == nullptr) {
-        return Status::InvalidArgument("sequence output must not be null");
-    }
-    *max_sequence = 0;
-    for (const auto& table : tables) {
-        if (table->metadata().minimum_sequence <= *max_sequence) {
-            return DatabaseCorruption(
-                "table generations contain overlapping sequence ranges"
-            );
-        }
-        *max_sequence = table->metadata().maximum_sequence;
-    }
-    return Status::Ok();
+    return expected.generation == actual.generation &&
+           expected.file_size == actual.file_size &&
+           expected.record_count == actual.record_count &&
+           expected.minimum_sequence == actual.minimum_sequence &&
+           expected.maximum_sequence == actual.maximum_sequence &&
+           expected.minimum_key == actual.minimum_key &&
+           expected.maximum_key == actual.maximum_key;
+}
+
+bool IsStorageTemporaryFile(std::string_view name) {
+    return name == "MANIFEST.tmp" ||
+           (name.size() > 8 && name.substr(name.size() - 8) == ".sst.tmp");
 }
 
 }  // namespace
@@ -150,18 +151,30 @@ Status Database::OpenWithEnvironment(
         }
     }
 
+    std::unique_ptr<DatabaseLock> lock;
+    auto status = DatabaseLock::Acquire(directory, &lock);
+    if (!status.ok()) {
+        return status;
+    }
+
     std::map<std::uint64_t, std::string> table_paths;
     std::map<std::uint64_t, std::string> wal_paths;
+    std::vector<std::string> temporary_paths;
+    bool manifest_exists = false;
     fs::directory_iterator iterator(directory, filesystem_error);
     const fs::directory_iterator end;
     while (!filesystem_error && iterator != end) {
         if (iterator->is_regular_file(filesystem_error)) {
             const std::string name = iterator->path().filename().string();
             std::uint64_t generation = 0;
-            if (ParseGenerationFile(name, "sst", &generation)) {
+            if (name == kManifestFileName) {
+                manifest_exists = true;
+            } else if (ParseGenerationFile(name, "sst", &generation)) {
                 table_paths.emplace(generation, iterator->path().string());
             } else if (ParseGenerationFile(name, "wal", &generation)) {
                 wal_paths.emplace(generation, iterator->path().string());
+            } else if (IsStorageTemporaryFile(name)) {
+                temporary_paths.push_back(iterator->path().string());
             }
         }
         iterator.increment(filesystem_error);
@@ -173,43 +186,93 @@ Status Database::OpenWithEnvironment(
         );
     }
 
-    std::vector<std::unique_ptr<SSTableReader>> tables;
-    tables.reserve(table_paths.size());
-    for (const auto& [generation, path] : table_paths) {
-        std::unique_ptr<SSTableReader> table;
-        auto status = SSTableReader::Open(path, options, &table);
+    Version version;
+    if (!manifest_exists) {
+        if (!table_paths.empty() || !wal_paths.empty()) {
+            return Status::VersionMismatch(
+                "database contains legacy files but no V5 MANIFEST"
+            );
+        }
+        version = Version::NewDatabase();
+        status = PublishManifest(directory, version, options, *environment);
         if (!status.ok()) {
             return status;
         }
-        if (table->metadata().generation != generation) {
+    } else {
+        status = LoadManifest(directory, options, &version);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+
+    std::map<std::uint64_t, const VersionTable*> live_tables;
+    for (const auto& table : version.tables()) {
+        live_tables.emplace(table.metadata.generation, &table);
+    }
+    std::vector<std::unique_ptr<SSTableReader>> tables;
+    tables.reserve(version.tables().size());
+    for (const auto& expected : version.tables()) {
+        const auto path = table_paths.find(expected.metadata.generation);
+        if (path == table_paths.end()) {
             return DatabaseCorruption(
-                "table filename and encoded generation disagree"
+                "MANIFEST references missing table " +
+                GenerationFileName(expected.metadata.generation, "sst")
+            );
+        }
+        std::unique_ptr<SSTableReader> table;
+        status = SSTableReader::Open(path->second, options, &table);
+        if (!status.ok()) {
+            return status;
+        }
+        if (!ManifestMetadataMatches(expected.metadata, table->metadata())) {
+            return DatabaseCorruption(
+                "MANIFEST and SSTable metadata disagree for file " +
+                std::to_string(expected.metadata.generation)
             );
         }
         tables.push_back(std::move(table));
     }
 
-    std::uint64_t last_sequence = 0;
-    auto status = ValidateTableSequenceOrder(tables, &last_sequence);
-    if (!status.ok()) {
-        return status;
-    }
-
     DatabaseOpenResult result;
     result.tables_loaded = tables.size();
+    bool directory_changed = false;
+    for (const auto& path : temporary_paths) {
+        status = environment->RemoveFile(path);
+        if (!status.ok()) {
+            return status;
+        }
+        ++result.orphan_files_removed;
+        directory_changed = true;
+    }
+    for (const auto& [generation, path] : table_paths) {
+        if (live_tables.find(generation) == live_tables.end()) {
+            status = environment->RemoveFile(path);
+            if (!status.ok()) {
+                return status;
+            }
+            ++result.orphan_files_removed;
+            directory_changed = true;
+        }
+    }
+
     std::vector<std::pair<std::uint64_t, std::string>> unmatched_wals;
     for (const auto& [generation, path] : wal_paths) {
-        if (table_paths.find(generation) != table_paths.end()) {
+        if (generation < version.next_file_number()) {
             status = environment->RemoveFile(path);
             if (!status.ok()) {
                 return status;
             }
             ++result.obsolete_wals_removed;
-        } else {
+            directory_changed = true;
+        } else if (generation == version.next_file_number()) {
             unmatched_wals.emplace_back(generation, path);
+        } else {
+            return DatabaseCorruption(
+                "WAL file number is ahead of the MANIFEST frontier"
+            );
         }
     }
-    if (result.obsolete_wals_removed != 0) {
+    if (directory_changed) {
         status = environment->SyncDirectory(directory);
         if (!status.ok()) {
             return status;
@@ -220,20 +283,10 @@ Status Database::OpenWithEnvironment(
     }
 
     MemTable mutable_memtable(options);
-    if (!tables.empty() &&
-        tables.back()->metadata().generation ==
-            std::numeric_limits<std::uint64_t>::max()) {
-        return DatabaseCorruption("table generation space is exhausted");
-    }
-    std::uint64_t mutable_generation =
-        tables.empty() ? 1 : tables.back()->metadata().generation + 1;
+    const std::uint64_t mutable_generation = version.next_file_number();
+    std::uint64_t last_sequence = version.last_sequence();
     std::unique_ptr<WalWriter> wal;
     if (!unmatched_wals.empty()) {
-        mutable_generation = unmatched_wals.front().first;
-        if (!tables.empty() &&
-            mutable_generation <= tables.back()->metadata().generation) {
-            return DatabaseCorruption("unflushed WAL generation is stale");
-        }
         std::unique_ptr<RecoveryFile> recovery_file;
         status = PosixRecoveryFile::Open(unmatched_wals.front().second, &recovery_file);
         if (!status.ok()) {
@@ -250,7 +303,7 @@ Status Database::OpenWithEnvironment(
             return status;
         }
         for (const auto& record : mutable_memtable.Records()) {
-            if (record.sequence <= last_sequence) {
+            if (record.sequence <= version.last_sequence()) {
                 return DatabaseCorruption(
                     "WAL sequence range overlaps published tables"
                 );
@@ -282,10 +335,14 @@ Status Database::OpenWithEnvironment(
         mutable_generation,
         std::move(wal),
         std::move(tables),
-        last_sequence
+        last_sequence,
+        std::move(version),
+        std::move(lock)
     ));
     result.max_sequence = last_sequence;
     result.active_generation = mutable_generation;
+    result.version_id = output->get()->version_id();
+    result.storage_format_version = kStorageFormatVersion;
     *open_result = result;
     return Status::Ok();
 }
@@ -298,16 +355,22 @@ Database::Database(
     std::uint64_t mutable_generation,
     std::unique_ptr<WalWriter> wal,
     std::vector<std::unique_ptr<SSTableReader>> tables,
-    std::uint64_t last_sequence
+    std::uint64_t last_sequence,
+    Version version,
+    std::unique_ptr<DatabaseLock> lock
 )
     : directory_(std::move(directory)),
       options_(options),
       environment_(std::move(environment)),
+      lock_(std::move(lock)),
+      version_(std::move(version)),
       mutable_(std::move(mutable_memtable)),
       mutable_generation_(mutable_generation),
       wal_(std::move(wal)),
       tables_(std::move(tables)),
       last_sequence_(last_sequence) {}
+
+Database::~Database() = default;
 
 Status Database::Put(
     std::string_view key,
@@ -460,21 +523,47 @@ Status Database::ContinueFlush() {
         return Status::Ok();
     }
 
-    if (!immutable_->table_published) {
-        std::unique_ptr<SSTableReader> published;
-        const auto publish_status = PublishTable(
-            directory_,
-            immutable_->generation,
-            immutable_->memtable,
-            options_,
-            *environment_,
-            &published
-        );
-        if (!publish_status.ok()) {
-            return publish_status;
+    if (!immutable_->version_published) {
+        if (immutable_->pending_table == nullptr) {
+            std::unique_ptr<SSTableReader> published;
+            const auto publish_status = PublishTable(
+                directory_,
+                immutable_->generation,
+                immutable_->memtable,
+                options_,
+                *environment_,
+                &published
+            );
+            if (!publish_status.ok()) {
+                return publish_status;
+            }
+            immutable_->pending_table = std::move(published);
         }
-        tables_.push_back(std::move(published));
-        immutable_->table_published = true;
+
+        VersionTable added;
+        added.level = 0;
+        added.metadata = immutable_->pending_table->metadata();
+        VersionEdit edit;
+        edit.added_tables.push_back(std::move(added));
+        edit.next_file_number = mutable_generation_;
+        edit.last_sequence = last_sequence_;
+        Version candidate;
+        auto status = version_.Apply(edit, options_, &candidate);
+        if (!status.ok()) {
+            return status;
+        }
+        status = PublishManifest(
+            directory_,
+            candidate,
+            options_,
+            *environment_
+        );
+        if (!status.ok()) {
+            return status;
+        }
+        tables_.push_back(std::move(immutable_->pending_table));
+        version_ = std::move(candidate);
+        immutable_->version_published = true;
     }
 
     if (!immutable_->wal_removed_and_synced) {

@@ -19,6 +19,8 @@ std::string_view CodeName(StatusCode code) {
             return "IOError";
         case StatusCode::kCorruption:
             return "Corruption";
+        case StatusCode::kVersionMismatch:
+            return "VersionMismatch";
         case StatusCode::kClosed:
             return "Closed";
     }
@@ -49,6 +51,10 @@ Status Status::IOError(std::string message) {
 
 Status Status::Corruption(std::string message) {
     return {StatusCode::kCorruption, std::move(message)};
+}
+
+Status Status::VersionMismatch(std::string message) {
+    return {StatusCode::kVersionMismatch, std::move(message)};
 }
 
 Status Status::Closed(std::string message) {

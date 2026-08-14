@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "minikv/flush.hpp"
+#include "minikv/manifest.hpp"
 #include "minikv/memtable.hpp"
 #include "minikv/options.hpp"
 #include "minikv/status.hpp"
@@ -16,16 +17,23 @@
 
 namespace minikv {
 
+class DatabaseLock;
+
 struct DatabaseOpenResult {
     std::size_t tables_loaded = 0;
     std::size_t wals_recovered = 0;
     std::size_t obsolete_wals_removed = 0;
+    std::size_t orphan_files_removed = 0;
     std::uint64_t max_sequence = 0;
     std::uint64_t active_generation = 0;
+    std::uint64_t version_id = 0;
+    std::uint8_t storage_format_version = 0;
 };
 
 class Database {
 public:
+    ~Database();
+
     static Status Open(
         std::string directory,
         Options options,
@@ -70,6 +78,9 @@ public:
     [[nodiscard]] std::size_t flushed_table_count() const noexcept {
         return tables_.size();
     }
+    [[nodiscard]] std::uint64_t version_id() const noexcept {
+        return version_.id();
+    }
     [[nodiscard]] const Status& status() const noexcept { return status_; }
 
 private:
@@ -83,7 +94,8 @@ private:
         std::uint64_t generation = 0;
         std::string wal_path;
         MemTable memtable;
-        bool table_published = false;
+        std::unique_ptr<SSTableReader> pending_table;
+        bool version_published = false;
         bool wal_removed_and_synced = false;
     };
 
@@ -95,7 +107,9 @@ private:
         std::uint64_t mutable_generation,
         std::unique_ptr<WalWriter> wal,
         std::vector<std::unique_ptr<SSTableReader>> tables,
-        std::uint64_t last_sequence
+        std::uint64_t last_sequence,
+        Version version,
+        std::unique_ptr<DatabaseLock> lock
     );
 
     Status Write(
@@ -113,6 +127,8 @@ private:
     std::string directory_;
     Options options_;
     std::shared_ptr<FlushEnvironment> environment_;
+    std::unique_ptr<DatabaseLock> lock_;
+    Version version_;
     MemTable mutable_;
     std::uint64_t mutable_generation_ = 0;
     std::unique_ptr<WalWriter> wal_;
