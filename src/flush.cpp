@@ -111,7 +111,7 @@ Status PublishTable(
     const MemTable& memtable,
     const Options& options,
     FlushEnvironment& environment,
-    std::unique_ptr<TableData>* published
+    std::unique_ptr<SSTableReader>* published
 ) {
     if (published == nullptr) {
         return Status::InvalidArgument("published table output must not be null");
@@ -167,7 +167,7 @@ Status PublishTable(
         return status;
     }
 
-    return DecodeTable(encoded, options, published);
+    return SSTableReader::Open(final_path, options, published);
 }
 
 }  // namespace minikv

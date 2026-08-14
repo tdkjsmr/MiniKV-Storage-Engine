@@ -94,7 +94,7 @@ private:
         MemTable mutable_memtable,
         std::uint64_t mutable_generation,
         std::unique_ptr<WalWriter> wal,
-        std::vector<std::unique_ptr<TableData>> tables,
+        std::vector<std::unique_ptr<SSTableReader>> tables,
         std::uint64_t last_sequence
     );
 
@@ -117,7 +117,7 @@ private:
     std::uint64_t mutable_generation_ = 0;
     std::unique_ptr<WalWriter> wal_;
     std::unique_ptr<ImmutableGeneration> immutable_;
-    std::vector<std::unique_ptr<TableData>> tables_;
+    std::vector<std::unique_ptr<SSTableReader>> tables_;
     std::uint64_t last_sequence_ = 0;
     Status status_;
 };

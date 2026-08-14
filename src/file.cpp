@@ -260,12 +260,41 @@ Status PosixRecoveryFile::Open(
         return Status::IOError(IOErrorMessage("open", path, errno));
     }
 
-    output->reset(new PosixRecoveryFile(file_descriptor, std::move(path)));
+    output->reset(new PosixRecoveryFile(file_descriptor, std::move(path), false));
     return Status::Ok();
 }
 
-PosixRecoveryFile::PosixRecoveryFile(int file_descriptor, std::string path)
-    : file_descriptor_(file_descriptor), path_(std::move(path)) {}
+Status PosixRecoveryFile::OpenReadOnly(
+    std::string path,
+    std::unique_ptr<RecoveryFile>* output
+) {
+    if (output == nullptr) {
+        return Status::InvalidArgument("read-only file output pointer must not be null");
+    }
+    output->reset();
+    if (path.empty()) {
+        return Status::InvalidArgument("read-only file path must not be empty");
+    }
+
+    int file_descriptor = -1;
+    do {
+        file_descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (file_descriptor < 0 && errno == EINTR);
+    if (file_descriptor < 0) {
+        return Status::IOError(IOErrorMessage("open", path, errno));
+    }
+    output->reset(new PosixRecoveryFile(file_descriptor, std::move(path), true));
+    return Status::Ok();
+}
+
+PosixRecoveryFile::PosixRecoveryFile(
+    int file_descriptor,
+    std::string path,
+    bool read_only
+)
+    : file_descriptor_(file_descriptor),
+      path_(std::move(path)),
+      read_only_(read_only) {}
 
 PosixRecoveryFile::~PosixRecoveryFile() {
     if (file_descriptor_ >= 0) {
@@ -337,6 +366,9 @@ ReadResult PosixRecoveryFile::ReadSome(
 }
 
 Status PosixRecoveryFile::Truncate(std::uint64_t size) {
+    if (read_only_) {
+        return Status::IOError("cannot truncate read-only file '" + path_ + "'");
+    }
     if (size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
         return Status::IOError("truncate size exceeds off_t range");
     }
@@ -353,6 +385,9 @@ Status PosixRecoveryFile::Truncate(std::uint64_t size) {
 }
 
 Status PosixRecoveryFile::Sync() {
+    if (read_only_) {
+        return Status::IOError("cannot sync read-only file '" + path_ + "'");
+    }
     int result = -1;
     do {
         result = ::fdatasync(file_descriptor_);

@@ -110,6 +110,10 @@ public:
         std::string path,
         std::unique_ptr<RecoveryFile>* output
     );
+    static Status OpenReadOnly(
+        std::string path,
+        std::unique_ptr<RecoveryFile>* output
+    );
 
     ~PosixRecoveryFile() override;
 
@@ -127,10 +131,11 @@ public:
     [[nodiscard]] std::string_view name() const noexcept override { return path_; }
 
 private:
-    PosixRecoveryFile(int file_descriptor, std::string path);
+    PosixRecoveryFile(int file_descriptor, std::string path, bool read_only);
 
     int file_descriptor_ = -1;
     std::string path_;
+    bool read_only_ = false;
 };
 
 }  // namespace minikv

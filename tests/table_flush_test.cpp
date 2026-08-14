@@ -3,7 +3,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <unistd.h>
 
@@ -38,75 +41,235 @@ private:
     bool valid_ = false;
 };
 
-minikv::MemTable SampleMemTable() {
-    minikv::MemTable table;
+minikv::Options SmallBlocks() {
+    minikv::Options options;
+    options.sstable_block_size = 100;
+    return options;
+}
+
+minikv::MemTable SampleMemTable(minikv::Options options = {}) {
+    minikv::MemTable table(options);
     minikv::test::Expect(table.Put(1, "alpha", "one").ok(), "sample Put must work");
     minikv::test::Expect(table.Delete(2, "beta").ok(), "sample Delete must work");
     minikv::test::Expect(table.Put(3, "gamma", "three").ok(), "sample Put must work");
     return table;
 }
 
-void TestTableRoundTripAndCorruption() {
-    const auto memtable = SampleMemTable();
+bool WriteFile(const fs::path& path, const std::string& bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    return output.good();
+}
+
+void TestEmptyDuplicateTombstoneAndDiskLookup() {
+    TemporaryDirectory directory("/tmp/minikv-v4-table-XXXXXX");
+    if (!directory.valid()) {
+        return;
+    }
+    const auto options = SmallBlocks();
+    std::string encoded;
+    minikv::MemTable empty(options);
+    minikv::test::Expect(
+        minikv::EncodeTable(1, empty, options, &encoded).code() ==
+            minikv::StatusCode::kInvalidArgument,
+        "empty SSTable must be rejected"
+    );
+
+    minikv::MemTable single(options);
+    minikv::test::Expect(single.Put(1, "only", "value").ok(),
+                         "single-key fixture must accept Put");
+    minikv::test::Expect(
+        minikv::EncodeTable(2, single, options, &encoded).ok(),
+        "single-key SSTable must encode"
+    );
+    const fs::path single_path = fs::path(directory.path()) / "single.sst";
+    minikv::test::Expect(WriteFile(single_path, encoded),
+                         "single-key SSTable must be written");
+    std::unique_ptr<minikv::SSTableReader> single_reader;
+    minikv::test::Expect(
+        minikv::SSTableReader::Open(
+            single_path.string(), options, &single_reader
+        ).ok() && single_reader->metadata().block_count == 1 &&
+            single_reader->Get("only").value == "value",
+        "single-key SSTable must reopen through one block"
+    );
+
+    minikv::MemTable table(options);
+    minikv::test::Expect(table.Put(1, "a", "old").ok(), "first duplicate Put works");
+    minikv::test::Expect(table.Put(2, "a", "new").ok(), "newer duplicate replaces old");
+    minikv::test::Expect(table.Put(3, "b", "two").ok(), "Put b works");
+    minikv::test::Expect(table.Put(4, "c", "three").ok(), "Put c works");
+    minikv::test::Expect(table.Delete(5, "d").ok(), "Delete d works");
+    minikv::test::Expect(table.Put(6, "e", "five").ok(), "Put e works");
+    minikv::test::Expect(table.Put(7, "f", "six").ok(), "Put f works");
+    minikv::test::Expect(table.Put(8, "g", "seven").ok(), "Put g works");
+
+    minikv::PosixFlushEnvironment environment;
+    std::unique_ptr<minikv::SSTableReader> reader;
+    minikv::test::Expect(
+        minikv::PublishTable(
+            directory.path(), 9, table, options, environment, &reader
+        ).ok(),
+        "block-oriented SSTable publication must succeed"
+    );
+    if (reader == nullptr) {
+        return;
+    }
+    const auto& metadata = reader->metadata();
+    minikv::test::Expect(
+        metadata.generation == 9 && metadata.record_count == 7 &&
+            metadata.minimum_sequence == 2 && metadata.maximum_sequence == 8,
+        "Footer summaries must match the visible generation"
+    );
+    minikv::test::Expect(
+        metadata.block_count >= 3 && metadata.minimum_key == "a" &&
+            metadata.maximum_key == "g",
+        "small block target must create a multi-block indexed table"
+    );
+
+    minikv::SSTableReadStats stats;
+    auto result = reader->Get("a", &stats);
+    minikv::test::Expect(
+        result.found() && result.value == "new" && result.sequence == 2,
+        "duplicate key must retain only its newest record"
+    );
+    minikv::test::Expect(
+        stats.data_blocks_read == 1,
+        "an indexed hit must read exactly one candidate data block"
+    );
+    result = reader->Get("g", &stats);
+    minikv::test::Expect(
+        result.found() && result.value == "seven" &&
+            stats.data_blocks_read == 1,
+        "the final key of the final block must be found with one read"
+    );
+    result = reader->Get("d", &stats);
+    minikv::test::Expect(result.deleted(), "tombstone must survive SSTable lookup");
+    minikv::test::Expect(
+        stats.data_blocks_read == 1,
+        "a tombstone lookup must read exactly one candidate block"
+    );
+    result = reader->Get("bb", &stats);
+    minikv::test::Expect(
+        result.status.IsNotFound() && stats.data_blocks_read == 1,
+        "a key between stored keys must inspect only its candidate block"
+    );
+    result = reader->Get("z", &stats);
+    minikv::test::Expect(
+        result.status.IsNotFound() && stats.data_blocks_read == 0,
+        "range rejection must avoid every data-block read"
+    );
+
+    std::vector<minikv::MemTableRecord> records;
+    minikv::test::Expect(
+        reader->ReadRecords(3, &records).ok() && records.size() == 3 &&
+            records.front().key == "a" && records.back().key == "c",
+        "diagnostic scan must honor key order and record limit"
+    );
+}
+
+void TestEveryByteAndRegionCorruption() {
+    TemporaryDirectory directory("/tmp/minikv-v4-corruption-XXXXXX");
+    if (!directory.valid()) {
+        return;
+    }
+    const auto options = SmallBlocks();
     std::string encoded;
     minikv::test::Expect(
-        minikv::EncodeTable(7, memtable, {}, &encoded).ok(),
-        "non-empty MemTable must encode as a V3 table"
+        minikv::EncodeTable(7, SampleMemTable(options), options, &encoded).ok(),
+        "corruption fixture must encode"
     );
     minikv::test::Expect(
-        encoded.substr(0, 4) == "MKST",
-        "V3 table magic must be stable"
+        encoded.substr(0, 4) == "MKST" &&
+            static_cast<std::uint8_t>(encoded[4]) == minikv::kTableFormatVersion,
+        "V4 SSTable magic and version must be stable"
     );
 
-    std::unique_ptr<minikv::TableData> decoded;
-    minikv::test::Expect(
-        minikv::DecodeTable(encoded, {}, &decoded).ok(),
-        "encoded table must decode"
-    );
-    minikv::test::Expect(
-        decoded->generation == 7 && decoded->max_sequence == 3,
-        "table generation and maximum sequence must round-trip"
-    );
-    minikv::test::Expect(
-        decoded->records.Get("alpha").value == "one",
-        "table value must round-trip"
-    );
-    minikv::test::Expect(
-        decoded->records.Lookup("beta").deleted(),
-        "table tombstone must round-trip"
-    );
-
+    const fs::path path = fs::path(directory.path()) / "damaged.sst";
     for (std::size_t index = 0; index < encoded.size(); ++index) {
         std::string damaged = encoded;
         damaged[index] ^= static_cast<char>(0x01);
-        decoded = std::make_unique<minikv::TableData>(99, minikv::Options{});
+        minikv::test::Expect(WriteFile(path, damaged), "damaged table must be written");
+        std::unique_ptr<minikv::SSTableReader> reader;
         minikv::test::Expect(
-            minikv::DecodeTable(damaged, {}, &decoded).code() ==
+            minikv::SSTableReader::Open(path.string(), options, &reader).code() ==
                 minikv::StatusCode::kCorruption,
-            "every single-byte table mutation must be rejected"
+            "every one-byte mutation in Header, block, index, or Footer must fail"
         );
         minikv::test::Expect(
-            decoded == nullptr,
-            "failed table decoding must clear its output"
+            reader == nullptr,
+            "corrupt SSTable must never expose a partial reader"
+        );
+    }
+
+    minikv::test::Expect(WriteFile(path, encoded.substr(0, encoded.size() - 1)),
+                         "truncated table must be written");
+    std::unique_ptr<minikv::SSTableReader> reader;
+    minikv::test::Expect(
+        minikv::SSTableReader::Open(path.string(), options, &reader).code() ==
+            minikv::StatusCode::kCorruption,
+        "truncated Footer must be rejected"
+    );
+}
+
+void TestRandomSortedTableAgainstReferenceModel() {
+    TemporaryDirectory directory("/tmp/minikv-v4-random-XXXXXX");
+    if (!directory.valid()) {
+        return;
+    }
+    auto options = SmallBlocks();
+    minikv::MemTable table(options);
+    std::map<std::string, std::string> reference;
+    std::mt19937_64 random(0x4456455253494F4EULL);
+    std::uint64_t sequence = 0;
+    for (int step = 0; step < 400; ++step) {
+        const std::string key = "key-" + std::to_string(random() % 137U);
+        ++sequence;
+        if (random() % 5U == 0) {
+            minikv::test::Expect(table.Delete(sequence, key).ok(), "random Delete works");
+            reference.erase(key);
+        } else {
+            const std::string value = "value-" + std::to_string(random());
+            minikv::test::Expect(table.Put(sequence, key, value).ok(), "random Put works");
+            reference[key] = value;
+        }
+    }
+
+    minikv::PosixFlushEnvironment environment;
+    std::unique_ptr<minikv::SSTableReader> reader;
+    minikv::test::Expect(
+        minikv::PublishTable(
+            directory.path(), 17, table, options, environment, &reader
+        ).ok(),
+        "random table publication must succeed"
+    );
+    if (reader == nullptr) {
+        return;
+    }
+    for (std::size_t id = 0; id < 137; ++id) {
+        const std::string key = "key-" + std::to_string(id);
+        const auto expected = reference.find(key);
+        const auto actual = reader->Get(key);
+        minikv::test::Expect(
+            expected == reference.end()
+                ? actual.status.IsNotFound() || actual.deleted()
+                : actual.found() && actual.value == expected->second,
+            "disk point lookup must match the random reference model"
         );
     }
 }
 
 void TestPublishCreatesOnlyFinalSyncedTable() {
-    TemporaryDirectory directory("/tmp/minikv-v3-table-XXXXXX");
+    TemporaryDirectory directory("/tmp/minikv-v4-publish-XXXXXX");
     if (!directory.valid()) {
         return;
     }
     minikv::PosixFlushEnvironment environment;
-    std::unique_ptr<minikv::TableData> published;
+    std::unique_ptr<minikv::SSTableReader> published;
     minikv::test::Expect(
         minikv::PublishTable(
-            directory.path(),
-            11,
-            SampleMemTable(),
-            {},
-            environment,
-            &published
+            directory.path(), 11, SampleMemTable(), {}, environment, &published
         ).ok(),
         "POSIX table publication must succeed"
     );
@@ -118,13 +281,13 @@ void TestPublishCreatesOnlyFinalSyncedTable() {
         "temporary table must not remain after publication"
     );
     minikv::test::Expect(
-        published != nullptr && published->records.Get("gamma").value == "three",
-        "publication must return the immutable read view"
+        published != nullptr && published->Get("gamma").value == "three",
+        "publication must return the disk-backed immutable reader"
     );
 }
 
 void TestPublishFailureOutputs() {
-    TemporaryDirectory directory("/tmp/minikv-v3-table-fail-XXXXXX");
+    TemporaryDirectory directory("/tmp/minikv-v4-table-fail-XXXXXX");
     if (!directory.valid()) {
         return;
     }
@@ -137,24 +300,17 @@ void TestPublishFailureOutputs() {
     };
     for (const auto failure : failures) {
         const std::uint64_t generation =
-            static_cast<std::uint64_t>(20) +
-            static_cast<std::uint64_t>(failure);
-        const fs::path final_path =
-            fs::path(directory.path()) /
+            static_cast<std::uint64_t>(20) + static_cast<std::uint64_t>(failure);
+        const fs::path final_path = fs::path(directory.path()) /
             minikv::GenerationFileName(generation, "sst");
         auto environment =
             std::make_shared<minikv::test::FaultInjectingFlushEnvironment>();
         environment->Arm(failure);
-        std::unique_ptr<minikv::TableData> published =
-            std::make_unique<minikv::TableData>(99, minikv::Options{});
+        std::unique_ptr<minikv::SSTableReader> published;
         minikv::test::Expect(
             minikv::PublishTable(
-                directory.path(),
-                generation,
-                SampleMemTable(),
-                {},
-                *environment,
-                &published
+                directory.path(), generation, SampleMemTable(), {},
+                *environment, &published
             ).code() == minikv::StatusCode::kIOError,
             "each publication failure point must propagate"
         );
@@ -177,8 +333,10 @@ void TestPublishFailureOutputs() {
 }  // namespace
 
 int main() {
-    TestTableRoundTripAndCorruption();
+    TestEmptyDuplicateTombstoneAndDiskLookup();
+    TestEveryByteAndRegionCorruption();
+    TestRandomSortedTableAgainstReferenceModel();
     TestPublishCreatesOnlyFinalSyncedTable();
     TestPublishFailureOutputs();
-    return minikv::test::Finish("table and flush");
+    return minikv::test::Finish("V4 SSTable and flush");
 }

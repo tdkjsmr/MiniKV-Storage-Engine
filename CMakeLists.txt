@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -69,6 +69,10 @@ target_include_directories(
         $<INSTALL_INTERFACE:include>
 )
 minikv_set_target_options(minikv)
+
+add_executable(minikv_sstable_dump tools/sstable_dump.cpp)
+target_link_libraries(minikv_sstable_dump PRIVATE minikv::minikv)
+minikv_set_target_options(minikv_sstable_dump)
 
 if(MINIKV_BUILD_TESTS)
     include(CTest)

@@ -55,7 +55,7 @@ Status PublishTable(
     const MemTable& memtable,
     const Options& options,
     FlushEnvironment& environment,
-    std::unique_ptr<TableData>* published
+    std::unique_ptr<SSTableReader>* published
 );
 
 }  // namespace minikv

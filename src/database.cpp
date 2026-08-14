@@ -53,30 +53,8 @@ bool ParseGenerationFile(
     return true;
 }
 
-Status ReadWholeFile(const std::string& path, std::string* bytes) {
-    if (bytes == nullptr) {
-        return Status::InvalidArgument("file bytes output must not be null");
-    }
-    bytes->clear();
-    std::unique_ptr<RecoveryFile> file;
-    auto status = PosixRecoveryFile::Open(path, &file);
-    if (!status.ok()) {
-        return status;
-    }
-    std::uint64_t size = 0;
-    status = file->Size(&size);
-    if (!status.ok()) {
-        return status;
-    }
-    if (size > std::numeric_limits<std::size_t>::max()) {
-        return Status::IOError("file is too large to load: '" + path + "'");
-    }
-    bytes->assign(static_cast<std::size_t>(size), '\0');
-    return ReadAllAt(*file, 0, bytes);
-}
-
 Status ValidateTableSequenceOrder(
-    const std::vector<std::unique_ptr<TableData>>& tables,
+    const std::vector<std::unique_ptr<SSTableReader>>& tables,
     std::uint64_t* max_sequence
 ) {
     if (max_sequence == nullptr) {
@@ -84,17 +62,12 @@ Status ValidateTableSequenceOrder(
     }
     *max_sequence = 0;
     for (const auto& table : tables) {
-        std::uint64_t minimum_sequence =
-            std::numeric_limits<std::uint64_t>::max();
-        for (const auto& record : table->records.Records()) {
-            minimum_sequence = std::min(minimum_sequence, record.sequence);
-        }
-        if (minimum_sequence <= *max_sequence) {
+        if (table->metadata().minimum_sequence <= *max_sequence) {
             return DatabaseCorruption(
                 "table generations contain overlapping sequence ranges"
             );
         }
-        *max_sequence = table->max_sequence;
+        *max_sequence = table->metadata().maximum_sequence;
     }
     return Status::Ok();
 }
@@ -138,9 +111,20 @@ Status Database::OpenWithEnvironment(
     output->reset();
     *open_result = {};
     if (directory.empty() || environment == nullptr ||
-        options.memtable_size_limit == 0) {
+        options.memtable_size_limit == 0 ||
+        options.max_key_size == 0 ||
+        options.max_key_size > std::numeric_limits<std::uint32_t>::max() ||
+        options.max_value_size > std::numeric_limits<std::uint32_t>::max() ||
+        options.max_value_size >
+            std::numeric_limits<std::uint32_t>::max() - kWalHeaderSize ||
+        options.max_key_size >
+            std::numeric_limits<std::uint32_t>::max() - kWalHeaderSize -
+                options.max_value_size ||
+        options.sstable_block_size < kTableBlockHeaderSize + kWalHeaderSize ||
+        options.sstable_block_size >
+            std::numeric_limits<std::uint32_t>::max() - kTableBlockHeaderSize) {
         return Status::InvalidArgument(
-            "database requires a directory, environment, and MemTable limit"
+            "database requires a directory, environment, and valid size limits"
         );
     }
 
@@ -189,20 +173,15 @@ Status Database::OpenWithEnvironment(
         );
     }
 
-    std::vector<std::unique_ptr<TableData>> tables;
+    std::vector<std::unique_ptr<SSTableReader>> tables;
     tables.reserve(table_paths.size());
     for (const auto& [generation, path] : table_paths) {
-        std::string bytes;
-        auto status = ReadWholeFile(path, &bytes);
+        std::unique_ptr<SSTableReader> table;
+        auto status = SSTableReader::Open(path, options, &table);
         if (!status.ok()) {
             return status;
         }
-        std::unique_ptr<TableData> table;
-        status = DecodeTable(bytes, options, &table);
-        if (!status.ok()) {
-            return status;
-        }
-        if (table->generation != generation) {
+        if (table->metadata().generation != generation) {
             return DatabaseCorruption(
                 "table filename and encoded generation disagree"
             );
@@ -242,15 +221,17 @@ Status Database::OpenWithEnvironment(
 
     MemTable mutable_memtable(options);
     if (!tables.empty() &&
-        tables.back()->generation == std::numeric_limits<std::uint64_t>::max()) {
+        tables.back()->metadata().generation ==
+            std::numeric_limits<std::uint64_t>::max()) {
         return DatabaseCorruption("table generation space is exhausted");
     }
     std::uint64_t mutable_generation =
-        tables.empty() ? 1 : tables.back()->generation + 1;
+        tables.empty() ? 1 : tables.back()->metadata().generation + 1;
     std::unique_ptr<WalWriter> wal;
     if (!unmatched_wals.empty()) {
         mutable_generation = unmatched_wals.front().first;
-        if (!tables.empty() && mutable_generation <= tables.back()->generation) {
+        if (!tables.empty() &&
+            mutable_generation <= tables.back()->metadata().generation) {
             return DatabaseCorruption("unflushed WAL generation is stale");
         }
         std::unique_ptr<RecoveryFile> recovery_file;
@@ -316,7 +297,7 @@ Database::Database(
     MemTable mutable_memtable,
     std::uint64_t mutable_generation,
     std::unique_ptr<WalWriter> wal,
-    std::vector<std::unique_ptr<TableData>> tables,
+    std::vector<std::unique_ptr<SSTableReader>> tables,
     std::uint64_t last_sequence
 )
     : directory_(std::move(directory)),
@@ -351,11 +332,20 @@ LookupResult Database::Get(std::string_view key) const {
             return UserVisible(std::move(result));
         }
     }
+    LookupResult newest{Status::NotFound("key does not exist"), 0,
+                        ValueType::kValue, {}};
     for (auto table = tables_.rbegin(); table != tables_.rend(); ++table) {
-        result = (*table)->records.Lookup(key);
-        if (!result.status.IsNotFound()) {
-            return UserVisible(std::move(result));
+        result = (*table)->Get(key);
+        if (!result.status.ok() && !result.status.IsNotFound()) {
+            return result;
         }
+        if (result.status.ok() &&
+            (!newest.status.ok() || result.sequence > newest.sequence)) {
+            newest = std::move(result);
+        }
+    }
+    if (newest.status.ok()) {
+        return UserVisible(std::move(newest));
     }
     return {
         Status::NotFound("key does not exist"),
@@ -471,7 +461,7 @@ Status Database::ContinueFlush() {
     }
 
     if (!immutable_->table_published) {
-        std::unique_ptr<TableData> published;
+        std::unique_ptr<SSTableReader> published;
         const auto publish_status = PublishTable(
             directory_,
             immutable_->generation,
