@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "minikv/bloom_filter.hpp"
 #include "minikv/file.hpp"
 #include "minikv/memtable.hpp"
 #include "minikv/options.hpp"
@@ -14,7 +15,7 @@
 
 namespace minikv {
 
-inline constexpr std::uint8_t kTableFormatVersion = 2;
+inline constexpr std::uint8_t kTableFormatVersion = 3;
 inline constexpr std::size_t kTableHeaderSize = 32;
 inline constexpr std::size_t kTableBlockHeaderSize = 20;
 inline constexpr std::size_t kTableIndexHeaderSize = 20;
@@ -31,14 +32,23 @@ struct SSTableMetadata {
     std::uint64_t data_size = 0;
     std::uint64_t index_offset = 0;
     std::uint64_t index_size = 0;
+    std::uint64_t bloom_offset = 0;
+    std::uint64_t bloom_size = 0;
+    std::uint64_t bloom_bit_count = 0;
+    std::uint8_t bloom_hash_count = 0;
     std::uint32_t block_count = 0;
     std::string minimum_key;
     std::string maximum_key;
 };
 
 struct SSTableReadStats {
-    std::size_t data_blocks_read = 0;
-    std::size_t bytes_read = 0;
+    std::uint64_t tables_considered = 0;
+    std::uint64_t range_rejections = 0;
+    std::uint64_t bloom_filter_checks = 0;
+    std::uint64_t bloom_filter_rejections = 0;
+    std::uint64_t bloom_false_positives = 0;
+    std::uint64_t data_blocks_read = 0;
+    std::uint64_t bytes_read = 0;
 };
 
 // Keeps only verified metadata and the sparse index in memory. Data blocks are
@@ -95,9 +105,10 @@ private:
     std::unique_ptr<RecoveryFile> file_;
     SSTableMetadata metadata_;
     std::vector<IndexEntry> index_;
+    std::unique_ptr<BloomFilter> bloom_filter_;
 };
 
-// Builds one immutable format-version-2 SSTable in memory. Publication and
+// Builds one immutable format-version-3 SSTable in memory. Publication and
 // directory durability are handled by PublishTable.
 Status EncodeTable(
     std::uint64_t generation,

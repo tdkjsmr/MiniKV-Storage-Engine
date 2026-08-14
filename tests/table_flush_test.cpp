@@ -152,12 +152,15 @@ void TestEmptyDuplicateTombstoneAndDiskLookup() {
     );
     result = reader->Get("bb", &stats);
     minikv::test::Expect(
-        result.status.IsNotFound() && stats.data_blocks_read == 1,
-        "a key between stored keys must inspect only its candidate block"
+        result.status.IsNotFound() && stats.bloom_filter_checks == 1 &&
+            stats.data_blocks_read + stats.bloom_filter_rejections == 1 &&
+            stats.bloom_false_positives == stats.data_blocks_read,
+        "an in-range miss must be Bloom-rejected or read one candidate block"
     );
     result = reader->Get("z", &stats);
     minikv::test::Expect(
-        result.status.IsNotFound() && stats.data_blocks_read == 0,
+        result.status.IsNotFound() && stats.range_rejections == 1 &&
+            stats.bloom_filter_checks == 0 && stats.data_blocks_read == 0,
         "range rejection must avoid every data-block read"
     );
 

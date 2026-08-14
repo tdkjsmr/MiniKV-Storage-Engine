@@ -446,6 +446,13 @@ void TestOpenValidation() {
             minikv::StatusCode::kInvalidArgument,
         "null database output must be rejected"
     );
+    options = {};
+    options.bloom_false_positive_rate = 1.0;
+    minikv::test::Expect(
+        minikv::Database::Open("/tmp/unused", options, &database, &result).code() ==
+            minikv::StatusCode::kInvalidArgument,
+        "invalid Bloom false-positive rate must be rejected"
+    );
 }
 
 void TestCorruptPublishedTableBlocksOpen() {

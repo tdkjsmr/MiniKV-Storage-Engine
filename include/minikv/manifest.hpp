@@ -16,7 +16,7 @@ namespace minikv {
 class FlushEnvironment;
 
 inline constexpr std::uint8_t kManifestFormatVersion = 1;
-inline constexpr std::uint8_t kStorageFormatVersion = 1;
+inline constexpr std::uint8_t kStorageFormatVersion = 2;
 inline constexpr std::size_t kManifestHeaderSize = 64;
 inline constexpr std::size_t kManifestTableFixedSize = 56;
 inline constexpr std::size_t kMaximumManifestSize = 64U * 1024U * 1024U;

@@ -64,7 +64,12 @@ int main(int argc, char** argv) {
               << "data_region=[" << metadata.data_offset << ','
               << metadata.data_size << "]\n"
               << "index_region=[" << metadata.index_offset << ','
-              << metadata.index_size << "]\n";
+              << metadata.index_size << "]\n"
+              << "bloom_region=[" << metadata.bloom_offset << ','
+              << metadata.bloom_size << "]\n"
+              << "bloom_bits=" << metadata.bloom_bit_count << '\n'
+              << "bloom_hashes="
+              << static_cast<unsigned>(metadata.bloom_hash_count) << '\n';
 
     std::vector<minikv::MemTableRecord> records;
     const auto read_status = reader->ReadRecords(limit, &records);

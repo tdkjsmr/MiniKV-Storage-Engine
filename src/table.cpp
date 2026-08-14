@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -91,7 +92,10 @@ Status ValidateTableOptions(const Options& options) {
         options.max_value_size > std::numeric_limits<std::uint32_t>::max() ||
         options.sstable_block_size < kTableBlockHeaderSize + kWalHeaderSize ||
         options.sstable_block_size >
-            std::numeric_limits<std::uint32_t>::max() - kTableBlockHeaderSize) {
+            std::numeric_limits<std::uint32_t>::max() - kTableBlockHeaderSize ||
+        !std::isfinite(options.bloom_false_positive_rate) ||
+        options.bloom_false_positive_rate <= 0.0 ||
+        options.bloom_false_positive_rate >= 1.0) {
         return Status::InvalidArgument("SSTable size options are invalid");
     }
     std::uint64_t maximum_record = kWalHeaderSize;
@@ -285,6 +289,29 @@ Status EncodeTable(
     PutFixed32(index, ChecksumParts(index, index_payload));
     index.append(index_payload);
 
+    std::string bloom;
+    if (options.bloom_filter_enabled) {
+        BloomFilter filter;
+        status = BloomFilter::Create(
+            records.size(),
+            options.bloom_false_positive_rate,
+            &filter
+        );
+        if (!status.ok()) {
+            return status;
+        }
+        for (const auto& record : records) {
+            status = filter.Add(record.key);
+            if (!status.ok()) {
+                return status;
+            }
+        }
+        status = EncodeBloomFilter(filter, &bloom);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+
     std::string header;
     header.append(kTableMagic.data(), kTableMagic.size());
     header.push_back(static_cast<char>(kTableFormatVersion));
@@ -297,10 +324,19 @@ Status EncodeTable(
 
     const std::uint64_t data_offset = kTableHeaderSize;
     const std::uint64_t data_size = data.size();
-    const std::uint64_t index_offset = data_offset + data_size;
+    std::uint64_t index_offset = 0;
     const std::uint64_t index_size = index.size();
-    const std::uint64_t footer_offset = index_offset + index_size;
-    const std::uint64_t file_size = footer_offset + kTableFooterSize;
+    std::uint64_t bloom_offset = 0;
+    const std::uint64_t bloom_size = bloom.size();
+    std::uint64_t footer_offset = 0;
+    std::uint64_t file_size = 0;
+    if (!CheckedAdd(data_offset, data_size, &index_offset) ||
+        !CheckedAdd(index_offset, index_size, &bloom_offset) ||
+        !CheckedAdd(bloom_offset, bloom_size, &footer_offset) ||
+        !CheckedAdd(footer_offset, kTableFooterSize, &file_size) ||
+        file_size > std::numeric_limits<std::size_t>::max()) {
+        return Status::InvalidArgument("SSTable physical size overflows");
+    }
 
     std::string footer;
     footer.append(kFooterMagic.data(), kFooterMagic.size());
@@ -316,8 +352,8 @@ Status EncodeTable(
     PutFixed64(footer, data_size);
     PutFixed64(footer, index_offset);
     PutFixed64(footer, index_size);
-    PutFixed64(footer, footer_offset);  // Reserved Bloom region offset.
-    PutFixed64(footer, 0);              // Reserved Bloom region size.
+    PutFixed64(footer, bloom_offset);
+    PutFixed64(footer, bloom_size);
     PutFixed32(footer, static_cast<std::uint32_t>(index_entries.size()));
     PutFixed32(footer, Crc32c(footer));
 
@@ -325,6 +361,7 @@ Status EncodeTable(
     destination->append(header);
     destination->append(data);
     destination->append(index);
+    destination->append(bloom);
     destination->append(footer);
     return Status::Ok();
 }
@@ -444,12 +481,15 @@ Status SSTableReader::Open(
     std::uint64_t expected_file_size = 0;
     if (data_offset != kTableHeaderSize || data_size == 0 ||
         index_size < kTableIndexHeaderSize ||
-        index_size > kMaximumTableIndexSize || bloom_size != 0 ||
+        index_size > kMaximumTableIndexSize ||
+        (bloom_size != 0 && bloom_size < kBloomFilterHeaderSize) ||
+        bloom_size > kBloomFilterHeaderSize + kMaximumBloomFilterSize ||
         !CheckedAdd(data_offset, data_size, &expected_index_offset) ||
         index_offset != expected_index_offset ||
         !CheckedAdd(index_offset, index_size, &expected_bloom_offset) ||
         bloom_offset != expected_bloom_offset ||
-        !CheckedAdd(bloom_offset, kTableFooterSize, &expected_file_size) ||
+        !CheckedAdd(bloom_offset, bloom_size, &expected_file_size) ||
+        !CheckedAdd(expected_file_size, kTableFooterSize, &expected_file_size) ||
         expected_file_size != file_size) {
         return TableCorruption("Footer regions overlap, contain gaps, or escape the file");
     }
@@ -503,8 +543,29 @@ Status SSTableReader::Open(
     reader->metadata_.data_size = data_size;
     reader->metadata_.index_offset = index_offset;
     reader->metadata_.index_size = index_size;
+    reader->metadata_.bloom_offset = bloom_offset;
+    reader->metadata_.bloom_size = bloom_size;
     reader->metadata_.block_count = block_count;
     reader->index_.reserve(block_count);
+
+    if (bloom_size != 0) {
+        std::string encoded_bloom;
+        status = ReadRegion(*reader->file_, bloom_offset, bloom_size, &encoded_bloom);
+        if (!status.ok()) {
+            return status;
+        }
+        auto filter = std::make_unique<BloomFilter>();
+        status = DecodeBloomFilter(encoded_bloom, filter.get());
+        if (!status.ok()) {
+            return TableCorruption(status.ToString());
+        }
+        if (filter->key_count() != record_count) {
+            return TableCorruption("Bloom key count disagrees with the Footer");
+        }
+        reader->metadata_.bloom_bit_count = filter->bit_count();
+        reader->metadata_.bloom_hash_count = filter->hash_count();
+        reader->bloom_filter_ = std::move(filter);
+    }
 
     std::string_view remaining =
         std::string_view(encoded_index).substr(kTableIndexHeaderSize);
@@ -569,6 +630,12 @@ Status SSTableReader::Open(
             return TableCorruption("data blocks disagree with the sparse index");
         }
         for (const auto& record : block_records_vector) {
+            if (reader->bloom_filter_ != nullptr &&
+                !reader->bloom_filter_->MayContain(record.key)) {
+                return TableCorruption(
+                    "Bloom filter has a false negative for a stored key"
+                );
+            }
             verified_minimum_sequence = std::min(
                 verified_minimum_sequence,
                 record.sequence
@@ -615,7 +682,7 @@ Status SSTableReader::ReadBlock(
     auto status = ReadRegion(*file_, entry.block_offset, entry.block_size, &block);
     if (stats != nullptr) {
         ++stats->data_blocks_read;
-        stats->bytes_read += block.size();
+        stats->bytes_read += static_cast<std::uint64_t>(block.size());
     }
     if (!status.ok()) {
         return status;
@@ -679,6 +746,7 @@ LookupResult SSTableReader::Get(
 ) const {
     if (stats != nullptr) {
         *stats = {};
+        stats->tables_considered = 1;
     }
     if (key.empty()) {
         return {
@@ -697,8 +765,25 @@ LookupResult SSTableReader::Get(
         };
     }
     if (key < metadata_.minimum_key || key > metadata_.maximum_key) {
+        if (stats != nullptr) {
+            ++stats->range_rejections;
+        }
         return {Status::NotFound("key is outside table range"), 0,
                 ValueType::kValue, {}};
+    }
+    const bool bloom_checked =
+        options_.bloom_filter_enabled && bloom_filter_ != nullptr;
+    if (bloom_checked) {
+        if (stats != nullptr) {
+            ++stats->bloom_filter_checks;
+        }
+        if (!bloom_filter_->MayContain(key)) {
+            if (stats != nullptr) {
+                ++stats->bloom_filter_rejections;
+            }
+            return {Status::NotFound("Bloom filter excludes key"), 0,
+                    ValueType::kValue, {}};
+        }
     }
 
     const auto upper = std::upper_bound(
@@ -730,6 +815,9 @@ LookupResult SSTableReader::Get(
         }
     );
     if (found == records.end() || found->key != key) {
+        if (stats != nullptr && bloom_checked) {
+            ++stats->bloom_false_positives;
+        }
         return {Status::NotFound("key does not exist in candidate block"), 0,
                 ValueType::kValue, {}};
     }

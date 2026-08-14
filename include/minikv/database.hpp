@@ -30,6 +30,19 @@ struct DatabaseOpenResult {
     std::uint8_t storage_format_version = 0;
 };
 
+struct DatabaseReadStats {
+    std::uint64_t point_lookups = 0;
+    std::uint64_t mutable_hits = 0;
+    std::uint64_t immutable_hits = 0;
+    std::uint64_t tables_considered = 0;
+    std::uint64_t range_rejections = 0;
+    std::uint64_t bloom_filter_checks = 0;
+    std::uint64_t bloom_filter_rejections = 0;
+    std::uint64_t bloom_false_positives = 0;
+    std::uint64_t data_blocks_read = 0;
+    std::uint64_t bytes_read = 0;
+};
+
 class Database {
 public:
     ~Database();
@@ -57,7 +70,10 @@ public:
         WriteOptions write_options = {}
     );
     Status Delete(std::string_view key, WriteOptions write_options = {});
-    [[nodiscard]] LookupResult Get(std::string_view key) const;
+    [[nodiscard]] LookupResult Get(
+        std::string_view key,
+        DatabaseReadStats* operation_stats = nullptr
+    ) const;
 
     // V3 flushes in the foreground. On failure, the immutable generation and
     // its WAL remain available and Flush can be retried.
@@ -80,6 +96,9 @@ public:
     }
     [[nodiscard]] std::uint64_t version_id() const noexcept {
         return version_.id();
+    }
+    [[nodiscard]] DatabaseReadStats read_statistics() const noexcept {
+        return read_statistics_;
     }
     [[nodiscard]] const Status& status() const noexcept { return status_; }
 
@@ -123,6 +142,11 @@ private:
     Status OpenMutableWal();
     [[nodiscard]] std::string WalPath(std::uint64_t generation) const;
     [[nodiscard]] static LookupResult UserVisible(LookupResult result);
+    [[nodiscard]] LookupResult FinishRead(
+        LookupResult result,
+        const DatabaseReadStats& operation,
+        DatabaseReadStats* operation_stats
+    ) const;
 
     std::string directory_;
     Options options_;
@@ -135,6 +159,7 @@ private:
     std::unique_ptr<ImmutableGeneration> immutable_;
     std::vector<std::unique_ptr<SSTableReader>> tables_;
     std::uint64_t last_sequence_ = 0;
+    mutable DatabaseReadStats read_statistics_;
     Status status_;
 };
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -73,6 +74,35 @@ bool IsStorageTemporaryFile(std::string_view name) {
            (name.size() > 8 && name.substr(name.size() - 8) == ".sst.tmp");
 }
 
+void AccumulateTableStats(
+    const SSTableReadStats& source,
+    DatabaseReadStats* destination
+) {
+    destination->tables_considered += source.tables_considered;
+    destination->range_rejections += source.range_rejections;
+    destination->bloom_filter_checks += source.bloom_filter_checks;
+    destination->bloom_filter_rejections += source.bloom_filter_rejections;
+    destination->bloom_false_positives += source.bloom_false_positives;
+    destination->data_blocks_read += source.data_blocks_read;
+    destination->bytes_read += source.bytes_read;
+}
+
+void AccumulateDatabaseStats(
+    const DatabaseReadStats& source,
+    DatabaseReadStats* destination
+) {
+    destination->point_lookups += source.point_lookups;
+    destination->mutable_hits += source.mutable_hits;
+    destination->immutable_hits += source.immutable_hits;
+    destination->tables_considered += source.tables_considered;
+    destination->range_rejections += source.range_rejections;
+    destination->bloom_filter_checks += source.bloom_filter_checks;
+    destination->bloom_filter_rejections += source.bloom_filter_rejections;
+    destination->bloom_false_positives += source.bloom_false_positives;
+    destination->data_blocks_read += source.data_blocks_read;
+    destination->bytes_read += source.bytes_read;
+}
+
 }  // namespace
 
 Database::ImmutableGeneration::ImmutableGeneration(
@@ -123,7 +153,10 @@ Status Database::OpenWithEnvironment(
                 options.max_value_size ||
         options.sstable_block_size < kTableBlockHeaderSize + kWalHeaderSize ||
         options.sstable_block_size >
-            std::numeric_limits<std::uint32_t>::max() - kTableBlockHeaderSize) {
+            std::numeric_limits<std::uint32_t>::max() - kTableBlockHeaderSize ||
+        !std::isfinite(options.bloom_false_positive_rate) ||
+        options.bloom_false_positive_rate <= 0.0 ||
+        options.bloom_false_positive_rate >= 1.0) {
         return Status::InvalidArgument(
             "database requires a directory, environment, and valid size limits"
         );
@@ -190,7 +223,7 @@ Status Database::OpenWithEnvironment(
     if (!manifest_exists) {
         if (!table_paths.empty() || !wal_paths.empty()) {
             return Status::VersionMismatch(
-                "database contains legacy files but no V5 MANIFEST"
+                "database contains legacy files but no supported MANIFEST"
             );
         }
         version = Version::NewDatabase();
@@ -384,23 +417,44 @@ Status Database::Delete(std::string_view key, WriteOptions write_options) {
     return Write(ValueType::kDeletion, key, {}, write_options);
 }
 
-LookupResult Database::Get(std::string_view key) const {
+LookupResult Database::Get(
+    std::string_view key,
+    DatabaseReadStats* operation_stats
+) const {
+    DatabaseReadStats operation;
+    operation.point_lookups = 1;
     auto result = mutable_.Lookup(key);
     if (!result.status.IsNotFound()) {
-        return UserVisible(std::move(result));
+        if (result.status.ok()) {
+            operation.mutable_hits = 1;
+        }
+        return FinishRead(
+            UserVisible(std::move(result)),
+            operation,
+            operation_stats
+        );
     }
     if (immutable_ != nullptr) {
         result = immutable_->memtable.Lookup(key);
         if (!result.status.IsNotFound()) {
-            return UserVisible(std::move(result));
+            if (result.status.ok()) {
+                operation.immutable_hits = 1;
+            }
+            return FinishRead(
+                UserVisible(std::move(result)),
+                operation,
+                operation_stats
+            );
         }
     }
     LookupResult newest{Status::NotFound("key does not exist"), 0,
                         ValueType::kValue, {}};
     for (auto table = tables_.rbegin(); table != tables_.rend(); ++table) {
-        result = (*table)->Get(key);
+        SSTableReadStats table_stats;
+        result = (*table)->Get(key, &table_stats);
+        AccumulateTableStats(table_stats, &operation);
         if (!result.status.ok() && !result.status.IsNotFound()) {
-            return result;
+            return FinishRead(std::move(result), operation, operation_stats);
         }
         if (result.status.ok() &&
             (!newest.status.ok() || result.sequence > newest.sequence)) {
@@ -408,14 +462,17 @@ LookupResult Database::Get(std::string_view key) const {
         }
     }
     if (newest.status.ok()) {
-        return UserVisible(std::move(newest));
+        return FinishRead(
+            UserVisible(std::move(newest)),
+            operation,
+            operation_stats
+        );
     }
-    return {
-        Status::NotFound("key does not exist"),
-        0,
-        ValueType::kValue,
-        {},
-    };
+    return FinishRead(
+        {Status::NotFound("key does not exist"), 0, ValueType::kValue, {}},
+        operation,
+        operation_stats
+    );
 }
 
 Status Database::Write(
@@ -615,6 +672,18 @@ LookupResult Database::UserVisible(LookupResult result) {
     if (result.deleted()) {
         result.status = Status::NotFound("key was deleted");
         result.value.clear();
+    }
+    return result;
+}
+
+LookupResult Database::FinishRead(
+    LookupResult result,
+    const DatabaseReadStats& operation,
+    DatabaseReadStats* operation_stats
+) const {
+    AccumulateDatabaseStats(operation, &read_statistics_);
+    if (operation_stats != nullptr) {
+        *operation_stats = operation;
     }
     return result;
 }
