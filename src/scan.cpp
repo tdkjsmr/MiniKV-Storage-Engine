@@ -5,6 +5,7 @@
 #include <limits>
 #include <optional>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -309,6 +310,10 @@ void AccumulateIteratorStatistics(
 }  // namespace
 
 ScanResult Database::Scan(const ScanOptions& scan_options) const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    if (!IsRunningLocked()) {
+        return ScanError(Status::Closed("database is not running"));
+    }
     if (scan_options.limit == 0 ||
         scan_options.limit > options_.maximum_scan_entries) {
         return ScanError(Status::InvalidArgument(

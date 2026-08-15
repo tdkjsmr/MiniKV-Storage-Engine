@@ -99,8 +99,9 @@ void TestReplayAndShortReads() {
     const auto status = minikv::RecoverWal(file, {}, &memtable, &result);
     minikv::test::Expect(status.ok(), "valid WAL must recover through short reads");
     minikv::test::Expect(
-        result.records_recovered == 4 && result.max_sequence == 4,
-        "recovery must count records and retain the maximum sequence"
+        result.records_recovered == 4 && result.min_sequence == 1 &&
+            result.max_sequence == 4,
+        "recovery must count records and retain the sequence range"
     );
     minikv::test::Expect(
         result.valid_bytes == first.size() + second.size() + third.size() + fourth.size(),

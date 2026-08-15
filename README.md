@@ -7,8 +7,8 @@ reproducible correctness tests.
 
 ## Current status
 
-V8 adds bounded deterministic range and prefix scans on top of the V7
-two-level compaction engine:
+V9 adds opt-in background maintenance, in-process read/write coordination, and
+an explicit shutdown lifecycle on top of the V8 scan engine:
 
 - binary-safe keys and values with configurable size limits;
 - monotonically increasing sequence numbers and last-write-wins semantics;
@@ -70,18 +70,29 @@ two-level compaction engine:
   CRC32C-protected continuation tokens bound to their range and database state;
 - scan statistics for sources and tables considered, data blocks and bytes
   read, records examined, obsolete versions collapsed, and tombstones hidden;
+- one serialized writer with any number of concurrent point or range readers;
+- an opt-in worker that Flushes one Immutable MemTable while the next WAL and
+  Mutable generation continue accepting writes;
+- recovery of the consecutive two-WAL state created by an in-progress
+  background Flush;
+- automatic L0-to-L1 Compaction at a configurable L0 file-count trigger;
+- concurrency-safe read and maintenance statistics;
+- observable, retryable background errors and writer backpressure when the
+  single Immutable slot is occupied;
+- an idempotent `Running -> Closing -> Closed` lifecycle whose Close path
+  stops the worker and Flushes committed Mutable data;
 - a read-only `minikv_sstable_dump` diagnostic utility;
 - deterministic random-model tests, exhaustive one-byte SSTable and MANIFEST
   corruption, per-stage Flush and Compaction publication failures, real
   SIGKILL commit-boundary tests, lock-conflict tests, restart tests, and
   sanitizer build options.
 
-V8 still uses foreground Flush and manual foreground Compaction. It supports
-only L0 and non-overlapping L1, not a general multi-level compaction policy. It
-does not yet have background work, in-process concurrent calls, compression,
-or an automatic storage-format upgrade path. Statistics are not yet
-concurrency-safe. Unsupported directory formats are rejected; migration must
-be an explicit offline operation.
+Background maintenance is disabled by default so existing applications retain
+foreground timing until they opt in. V9 still supports only one Immutable
+generation, L0, and non-overlapping L1; it does not provide MVCC, multi-key
+transactions, lock-free maintenance, compression, or an automatic
+storage-format upgrade path. Unsupported directory formats are rejected;
+migration must be an explicit offline operation.
 
 ## Public data model and operation semantics
 
@@ -99,11 +110,18 @@ globally ordered within the prefix, and an empty prefix is the deterministic
 load-all operation. Every scan has a positive limit no greater than
 `Options::maximum_scan_entries`, which defaults to 1,000.
 
-V8 remains single-threaded. One scan call observes the Database state at that
-call. A continuation token can be reused after restart while the logical state
-is unchanged, but any successful Put/Delete or Version-changing Flush/
-Compaction makes it explicitly stale. V9 will introduce synchronization and
-stable views for concurrent calls; V8 does not claim a cross-mutation snapshot.
+V9 serializes Put/Delete, Version publication, and lifecycle transitions with
+one exclusive database lock. Get and Scan use a shared lock, so readers can run
+concurrently and each operation sees a stable state for its complete call.
+Maintenance publication waits for active readers, and readers never observe a
+half-switched Version. A long Scan can delay Version publication, and V9 does
+not claim an MVCC or cross-call range snapshot.
+
+A continuation token can be reused after restart while both its logical and
+physical database state are unchanged. Successful Put/Delete or a
+Version-changing Flush/Compaction makes it explicitly stale. Normal Close may
+Flush a non-empty Mutable generation, so a token created before that Close can
+also become stale.
 
 ## WAL format version 1
 
@@ -156,6 +174,9 @@ Each generation uses a 20-digit file number:
 00000000000000000001.wal
     -> Mutable generation 1 reaches its byte limit
     -> Immutable generation 1
+    -> open and directory-sync generation 2 WAL
+    -> return the committed threshold write
+    -> background worker starts generation 1 Flush
     -> 00000000000000000001.sst.tmp
     -> fdatasync(table)
     -> rename to 00000000000000000001.sst
@@ -168,7 +189,7 @@ Each generation uses a 20-digit file number:
     -> publish the new in-memory Version
     -> remove generation 1 WAL
     -> fsync(database directory)
-    -> open generation 2 WAL
+    -> retain generation 2 as the active WAL
 ```
 
 The old WAL remains authoritative until the table is durable, validated, and
@@ -178,9 +199,20 @@ unreferenced table is removed; the new MANIFEST means the table is loaded and
 the redundant old WAL is removed. A half-published in-memory Version is never
 observable.
 
-An automatic Flush happens after the threshold-crossing write has completed
-its WAL and MemTable steps. If maintenance then fails, that record remains
-readable and recoverable even though the call reports an I/O error.
+With `Options::background_maintenance=true`, the threshold-crossing write is
+committed to its WAL and MemTable, the generation is frozen, and the next WAL
+is synced before the worker builds the SSTable. SSTable construction runs
+without the database state lock, so reads and next-generation writes can
+progress. Manifest publication remains exclusively locked. If the next
+Mutable reaches its limit while the Immutable slot is occupied, the writer
+waits on a predicate loop until Flush completes, Close begins, or a background
+error occurs.
+
+The MANIFEST sequence frontier advances only through the maximum Sequence in
+the Immutable generation being published. It never claims newer records that
+still exist only in the next WAL. Recovery accepts either one active WAL or
+two consecutive WALs representing one Immutable plus one Mutable generation.
+All other WAL gaps or future generations are corruption.
 
 ## Directory storage format and MANIFEST version 1
 
@@ -417,6 +449,70 @@ Flush/Compaction, restart, and post-Open SSTable corruption. Run it directly:
 ./build/minikv_range_scan_test
 ```
 
+## Background maintenance, concurrency, and Close
+
+Background work is opt-in and uses one worker per open Database:
+
+```cpp
+minikv::Options options;
+options.background_maintenance = true;
+options.level0_compaction_trigger = 4;
+
+std::unique_ptr<minikv::Database> database;
+minikv::DatabaseOpenResult opened;
+minikv::Status status = minikv::Database::Open(
+    "./data", options, &database, &opened
+);
+if (status.ok()) {
+    status = database->Put("key", "value");
+}
+if (status.ok()) {
+    status = database->WaitForBackgroundWork();
+}
+const auto maintenance = database->background_statistics();
+const minikv::Status close_status = database->Close();
+```
+
+The state lock is acquired shared by Get, Scan, and read-only state observers.
+Put/Delete, foreground maintenance, Version publication, and Close acquire it
+exclusively. The read-statistics mutex is taken only after the state lock and
+is never used to acquire the state lock. The worker uses the same exclusive
+state lock, but releases it while encoding and publishing the immutable table
+file; it reacquires the lock before publishing MANIFEST and changing Version.
+
+A threshold Put/Delete reports the WAL commit result, not a later worker
+result. Background errors are returned by `WaitForBackgroundWork()` and
+`background_status()`, increment `BackgroundMaintenanceStats::failures`, and
+remain retryable through foreground `Flush()`. Once the next Mutable reaches
+its limit, further writes wait rather than creating an unbounded Immutable
+queue. Any background error pauses new writes until a foreground Flush/Compact
+retry succeeds, preventing failed maintenance file numbers from overlapping a
+new generation. Automatic Compaction runs only when the just-completed Flush
+leaves the Mutable empty; otherwise it is deferred to a later maintenance
+opportunity.
+
+Close first transitions to Closing under the exclusive lock, so already active
+readers finish and no new operation can start. It wakes blocked writers, stops
+and joins the worker, retries an outstanding Immutable Flush, Flushes a
+non-empty Mutable, releases the process lock, and transitions to Closed. Close
+does not require Compaction. Repeated or concurrent Close calls return the same
+first result. A failed Close still releases resources; its retained WAL is the
+recovery authority on the next Open. The destructor calls Close and cannot
+report its result, so callers that need error handling should call Close
+explicitly. If a Compaction state already exists, Close retries it, but it does
+not start a new Compaction.
+
+The V9 suite blocks table creation to prove next-generation Put/Get progress,
+recovers crashes with two consecutive WALs before and after old-Manifest
+publication, retries a background publication error, triggers automatic
+Compaction, verifies a failed Close remains recoverable, and races four readers,
+one serialized writer, and two Close calls.
+Run it directly with:
+
+```bash
+./build/minikv_concurrency_test
+```
+
 ## Build and test
 
 Requirements:
@@ -443,8 +539,9 @@ cmake --build build-ubsan --parallel
 ctest --test-dir build-ubsan --output-on-failure
 ```
 
-ThreadSanitizer is configured for later concurrent phases and must use its own
-build directory.
+ThreadSanitizer is configured and must use its own build directory. Some
+virtualized Linux environments cannot initialize its shadow-memory mapping;
+that platform failure must not be reported as a passing race check.
 
 Inspect an SSTable without loading it into the database:
 
@@ -463,10 +560,12 @@ flowchart LR
     Q --> L[Write-ahead log]
     L --> M[Mutable MemTable]
     M --> I[Immutable MemTable]
-    I --> F[Flush]
+    I --> F[Background Flush worker]
     F --> S[Indexed L0 SSTable]
     S --> V[Atomic MANIFEST / Version]
-    V --> C[L0 to L1 Compaction]
+    V --> C[Manual or triggered L0 to L1 Compaction]
+
+    N[Next generation WAL] --> M
 
     R[Get] --> M
     R --> I
@@ -490,7 +589,7 @@ The roadmap is incremental:
 9. V8: bounded deterministic range/prefix scans and continuation tokens
    (complete).
 10. V9: background Flush/Compaction, single-writer/multi-reader coordination,
-    stable scan views, and idempotent shutdown.
+    stable scan views, and idempotent shutdown (complete).
 11. V10: model, fault, crash, format-compatibility, fuzz, and concurrency stress
     testing with stable error categories.
 12. V11: reproducible workloads, latency percentiles, amplification metrics,
@@ -509,6 +608,10 @@ The roadmap is incremental:
   immutable metadata.
 - Files absent from the current Version never participate in reads.
 - At most one process owns a database directory's exclusive `LOCK`.
+- A background Flush publishes only its Immutable generation's Sequence
+  frontier; newer WAL records are never claimed by an older MANIFEST.
+- Closing rejects new work, joins the worker, and leaves every unflushed
+  committed record recoverable from a retained WAL.
 
 ## Scope
 

@@ -358,6 +358,10 @@ void TestPaginationTokenIntegrityRestartAndStaleness() {
             "pagination Put must succeed"
         );
     }
+    minikv::test::Expect(
+        database->Flush().ok(),
+        "pagination fixture must stabilize its Version before token creation"
+    );
     const auto first = database->ScanPrefix("p:", 7);
     minikv::test::Expect(
         first.status.ok() && first.entries.size() == 7 && first.truncated &&

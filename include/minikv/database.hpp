@@ -1,10 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "minikv/compaction.hpp"
@@ -58,6 +62,20 @@ struct CompactionStats {
     std::uint64_t elapsed_microseconds = 0;
 };
 
+enum class DatabaseState : std::uint8_t {
+    kRunning = 0,
+    kClosing = 1,
+    kClosed = 2,
+};
+
+struct BackgroundMaintenanceStats {
+    std::uint64_t flushes_completed = 0;
+    std::uint64_t compactions_completed = 0;
+    std::uint64_t failures = 0;
+    bool work_scheduled = false;
+    bool work_running = false;
+};
+
 class Database {
 public:
     ~Database();
@@ -100,6 +118,14 @@ public:
         std::string_view continuation_token = {}
     ) const;
 
+    // Stops new operations, joins the worker, and flushes committed Mutable
+    // data. Repeated calls return the first Close result.
+    Status Close();
+
+    // Waits for currently scheduled background maintenance. It does not flush
+    // a below-threshold Mutable MemTable.
+    Status WaitForBackgroundWork();
+
     // V3 flushes in the foreground. On failure, the immutable generation and
     // its WAL remain available and Flush can be retried.
     Status Flush();
@@ -108,35 +134,22 @@ public:
     // overlapping L1 range are committed through one VersionEdit.
     Status Compact(CompactionStats* stats = nullptr);
 
-    [[nodiscard]] std::uint64_t last_sequence() const noexcept {
-        return last_sequence_;
-    }
-    [[nodiscard]] std::uint64_t mutable_generation() const noexcept {
-        return mutable_generation_;
-    }
-    [[nodiscard]] std::size_t mutable_size() const noexcept {
-        return mutable_.ApproximateDataSize();
-    }
-    [[nodiscard]] bool has_immutable() const noexcept {
-        return immutable_ != nullptr;
-    }
-    [[nodiscard]] std::size_t flushed_table_count() const noexcept {
-        return tables_.size();
-    }
+    [[nodiscard]] std::uint64_t last_sequence() const;
+    [[nodiscard]] std::uint64_t mutable_generation() const;
+    [[nodiscard]] std::size_t mutable_size() const;
+    [[nodiscard]] bool has_immutable() const;
+    [[nodiscard]] std::size_t flushed_table_count() const;
     [[nodiscard]] std::size_t level_table_count(
         std::uint32_t level
-    ) const noexcept;
-    [[nodiscard]] std::uint64_t version_id() const noexcept {
-        return version_.id();
-    }
-    [[nodiscard]] DatabaseReadStats read_statistics() const noexcept {
-        return read_statistics_;
-    }
-    [[nodiscard]] const CompactionStats& last_compaction_statistics()
-        const noexcept {
-        return last_compaction_statistics_;
-    }
-    [[nodiscard]] const Status& status() const noexcept { return status_; }
+    ) const;
+    [[nodiscard]] std::uint64_t version_id() const;
+    [[nodiscard]] DatabaseReadStats read_statistics() const;
+    [[nodiscard]] CompactionStats last_compaction_statistics() const;
+    [[nodiscard]] BackgroundMaintenanceStats background_statistics()
+        const;
+    [[nodiscard]] Status background_status() const;
+    [[nodiscard]] DatabaseState state() const;
+    [[nodiscard]] Status status() const;
 
 private:
     struct CompactionState;
@@ -149,6 +162,7 @@ private:
         );
 
         std::uint64_t generation = 0;
+        std::uint64_t maximum_sequence = 0;
         std::string wal_path;
         MemTable memtable;
         std::unique_ptr<SSTableReader> pending_table;
@@ -163,6 +177,7 @@ private:
         MemTable mutable_memtable,
         std::uint64_t mutable_generation,
         std::unique_ptr<WalWriter> wal,
+        std::unique_ptr<ImmutableGeneration> immutable,
         std::vector<std::unique_ptr<SSTableReader>> tables,
         std::uint64_t last_sequence,
         Version version,
@@ -175,11 +190,20 @@ private:
         std::string_view value,
         WriteOptions write_options
     );
-    Status FreezeMutable();
+    Status FreezeMutable(bool open_next_wal);
+    Status FlushLocked();
+    Status CompactLocked(CompactionStats* stats);
     Status ContinueFlush();
     Status PrepareCompaction();
     Status ContinueCompaction(CompactionStats* stats);
     Status OpenMutableWal();
+    Status StartBackgroundWorker();
+    void ScheduleBackgroundWorkLocked();
+    void BackgroundLoop();
+    Status RunBackgroundWorkLocked(
+        std::unique_lock<std::shared_mutex>& state_lock
+    );
+    [[nodiscard]] bool IsRunningLocked() const noexcept;
     [[nodiscard]] std::string WalPath(std::uint64_t generation) const;
     [[nodiscard]] static LookupResult UserVisible(LookupResult result);
     [[nodiscard]] LookupResult FinishRead(
@@ -203,6 +227,18 @@ private:
     mutable DatabaseReadStats read_statistics_;
     CompactionStats last_compaction_statistics_;
     Status status_;
+    Status background_status_;
+    Status close_status_;
+    DatabaseState state_ = DatabaseState::kRunning;
+    mutable std::shared_mutex state_mutex_;
+    mutable std::mutex statistics_mutex_;
+    std::condition_variable_any background_cv_;
+    std::condition_variable_any lifecycle_cv_;
+    std::thread background_thread_;
+    bool background_work_requested_ = false;
+    bool background_work_running_ = false;
+    bool stop_background_ = false;
+    BackgroundMaintenanceStats background_statistics_;
 };
 
 }  // namespace minikv

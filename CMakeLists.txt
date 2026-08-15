@@ -2,10 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.8.0
+    VERSION 0.9.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
+
+find_package(Threads REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,6 +75,7 @@ target_include_directories(
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
+target_link_libraries(minikv PUBLIC Threads::Threads)
 minikv_set_target_options(minikv)
 
 add_executable(minikv_sstable_dump tools/sstable_dump.cpp)
@@ -137,4 +140,9 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_range_scan_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_range_scan_test)
     add_test(NAME range_scan COMMAND minikv_range_scan_test)
+
+    add_executable(minikv_concurrency_test tests/concurrency_test.cpp)
+    target_link_libraries(minikv_concurrency_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_concurrency_test)
+    add_test(NAME concurrency COMMAND minikv_concurrency_test)
 endif()

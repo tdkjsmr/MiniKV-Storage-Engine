@@ -13,6 +13,7 @@ struct Options {
     static constexpr std::size_t kDefaultCompactionOutputSizeLimit =
         2U * 1024U * 1024U;
     static constexpr std::size_t kDefaultMaximumScanEntries = 1000;
+    static constexpr std::size_t kDefaultLevel0CompactionTrigger = 4;
 
     std::size_t max_key_size = kDefaultMaxKeySize;
     std::size_t max_value_size = kDefaultMaxValueSize;
@@ -23,6 +24,11 @@ struct Options {
     std::size_t compaction_output_size_limit =
         kDefaultCompactionOutputSizeLimit;
     std::size_t maximum_scan_entries = kDefaultMaximumScanEntries;
+    // Disabled by default so applications can opt into the V9 lifecycle
+    // contract without changing the timing of existing foreground Flushes.
+    bool background_maintenance = false;
+    std::size_t level0_compaction_trigger =
+        kDefaultLevel0CompactionTrigger;
 };
 
 }  // namespace minikv

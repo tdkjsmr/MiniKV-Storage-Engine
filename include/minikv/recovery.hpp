@@ -14,6 +14,7 @@ struct WalRecoveryResult {
     std::size_t records_recovered = 0;
     std::uint64_t valid_bytes = 0;
     std::uint64_t discarded_tail_bytes = 0;
+    std::uint64_t min_sequence = 0;
     std::uint64_t max_sequence = 0;
     bool tail_truncated = false;
 };

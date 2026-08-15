@@ -171,6 +171,9 @@ Status RecoverWal(
             std::numeric_limits<std::size_t>::max()) {
             return Status::Corruption("WAL recovery record count overflows size_t");
         }
+        if (recovered_result.records_recovered == 0) {
+            recovered_result.min_sequence = decoded_record.record.sequence;
+        }
         ++recovered_result.records_recovered;
         recovered_result.max_sequence = decoded_record.record.sequence;
         offset += record_size;

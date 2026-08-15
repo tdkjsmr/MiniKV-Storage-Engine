@@ -8,8 +8,10 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include "minikv/file.hpp"
@@ -114,7 +116,11 @@ Database::ImmutableGeneration::ImmutableGeneration(
 )
     : generation(immutable_generation),
       wal_path(std::move(immutable_wal_path)),
-      memtable(std::move(immutable_memtable)) {}
+      memtable(std::move(immutable_memtable)) {
+    for (const auto& record : memtable.Records()) {
+        maximum_sequence = std::max(maximum_sequence, record.sequence);
+    }
+}
 
 struct Database::CompactionState {
     std::set<std::uint64_t> input_file_numbers;
@@ -164,6 +170,7 @@ Status Database::OpenWithEnvironment(
     if (directory.empty() || environment == nullptr ||
         options.memtable_size_limit == 0 ||
         options.compaction_output_size_limit == 0 ||
+        options.level0_compaction_trigger == 0 ||
         options.maximum_scan_entries == 0 ||
         options.maximum_scan_entries >=
             std::numeric_limits<std::uint32_t>::max() ||
@@ -321,7 +328,12 @@ Status Database::OpenWithEnvironment(
             }
             ++result.obsolete_wals_removed;
             directory_changed = true;
-        } else if (generation == version.next_file_number()) {
+        } else if (
+            generation == version.next_file_number() ||
+            (version.next_file_number() !=
+                 std::numeric_limits<std::uint64_t>::max() &&
+             generation == version.next_file_number() + 1U)
+        ) {
             unmatched_wals.emplace_back(generation, path);
         } else {
             return DatabaseCorruption(
@@ -335,17 +347,28 @@ Status Database::OpenWithEnvironment(
             return status;
         }
     }
-    if (unmatched_wals.size() > 1) {
-        return DatabaseCorruption("multiple unflushed WAL generations exist");
+    if (unmatched_wals.size() > 2) {
+        return DatabaseCorruption("too many unflushed WAL generations exist");
+    }
+    if (unmatched_wals.size() == 2 &&
+        (unmatched_wals[0].first != version.next_file_number() ||
+         unmatched_wals[1].first != version.next_file_number() + 1U)) {
+        return DatabaseCorruption("unflushed WAL generations are not consecutive");
     }
 
     MemTable mutable_memtable(options);
-    const std::uint64_t mutable_generation = version.next_file_number();
+    std::unique_ptr<ImmutableGeneration> immutable;
+    std::uint64_t mutable_generation = version.next_file_number();
     std::uint64_t last_sequence = version.last_sequence();
     std::unique_ptr<WalWriter> wal;
-    if (!unmatched_wals.empty()) {
+    std::uint64_t previous_wal_max_sequence = version.last_sequence();
+    for (std::size_t wal_index = 0; wal_index < unmatched_wals.size(); ++wal_index) {
+        MemTable recovered(options);
         std::unique_ptr<RecoveryFile> recovery_file;
-        status = PosixRecoveryFile::Open(unmatched_wals.front().second, &recovery_file);
+        status = PosixRecoveryFile::Open(
+            unmatched_wals[wal_index].second,
+            &recovery_file
+        );
         if (!status.ok()) {
             return status;
         }
@@ -353,22 +376,37 @@ Status Database::OpenWithEnvironment(
         status = RecoverWal(
             *recovery_file,
             options,
-            &mutable_memtable,
+            &recovered,
             &recovery_result
         );
         if (!status.ok()) {
             return status;
         }
-        for (const auto& record : mutable_memtable.Records()) {
-            if (record.sequence <= version.last_sequence()) {
-                return DatabaseCorruption(
-                    "WAL sequence range overlaps published tables"
-                );
-            }
+        if (recovery_result.records_recovered != 0 &&
+            recovery_result.min_sequence <= previous_wal_max_sequence) {
+            return DatabaseCorruption(
+                "WAL sequence range overlaps an older durable generation"
+            );
         }
         last_sequence = std::max(last_sequence, recovery_result.max_sequence);
+        previous_wal_max_sequence = recovery_result.max_sequence;
         ++result.wals_recovered;
         recovery_file.reset();
+        if (unmatched_wals.size() == 2 && wal_index == 0) {
+            if (recovered.empty()) {
+                return DatabaseCorruption(
+                    "an Immutable WAL generation must not be empty"
+                );
+            }
+            immutable = std::make_unique<ImmutableGeneration>(
+                unmatched_wals[wal_index].first,
+                unmatched_wals[wal_index].second,
+                std::move(recovered)
+            );
+        } else {
+            mutable_generation = unmatched_wals[wal_index].first;
+            mutable_memtable = std::move(recovered);
+        }
     }
 
     const std::string active_wal_path = JoinPath(
@@ -391,6 +429,7 @@ Status Database::OpenWithEnvironment(
         std::move(mutable_memtable),
         mutable_generation,
         std::move(wal),
+        std::move(immutable),
         std::move(tables),
         last_sequence,
         std::move(version),
@@ -401,6 +440,12 @@ Status Database::OpenWithEnvironment(
     result.version_id = output->get()->version_id();
     result.storage_format_version = kStorageFormatVersion;
     *open_result = result;
+    status = output->get()->StartBackgroundWorker();
+    if (!status.ok()) {
+        output->reset();
+        *open_result = {};
+        return status;
+    }
     return Status::Ok();
 }
 
@@ -411,6 +456,7 @@ Database::Database(
     MemTable mutable_memtable,
     std::uint64_t mutable_generation,
     std::unique_ptr<WalWriter> wal,
+    std::unique_ptr<ImmutableGeneration> immutable,
     std::vector<std::unique_ptr<SSTableReader>> tables,
     std::uint64_t last_sequence,
     Version version,
@@ -424,10 +470,183 @@ Database::Database(
       mutable_(std::move(mutable_memtable)),
       mutable_generation_(mutable_generation),
       wal_(std::move(wal)),
+      immutable_(std::move(immutable)),
       tables_(std::move(tables)),
       last_sequence_(last_sequence) {}
 
-Database::~Database() = default;
+Database::~Database() {
+    static_cast<void>(Close());
+}
+
+Status Database::StartBackgroundWorker() {
+    if (!options_.background_maintenance) {
+        return Status::Ok();
+    }
+    if (immutable_ != nullptr) {
+        background_work_requested_ = true;
+        background_statistics_.work_scheduled = true;
+    }
+    try {
+        background_thread_ = std::thread(&Database::BackgroundLoop, this);
+    } catch (const std::system_error& error) {
+        return Status::IOError(
+            "start database background worker: " + std::string(error.what())
+        );
+    }
+    background_cv_.notify_all();
+    return Status::Ok();
+}
+
+void Database::ScheduleBackgroundWorkLocked() {
+    if (!options_.background_maintenance || stop_background_) {
+        return;
+    }
+    background_work_requested_ = true;
+    background_statistics_.work_scheduled = true;
+    background_cv_.notify_all();
+}
+
+Status Database::RunBackgroundWorkLocked(
+    std::unique_lock<std::shared_mutex>& state_lock
+) {
+    const bool had_immutable = immutable_ != nullptr;
+    if (immutable_ != nullptr && !immutable_->version_published &&
+        immutable_->pending_table == nullptr) {
+        ImmutableGeneration* const generation = immutable_.get();
+        std::unique_ptr<SSTableReader> published;
+        state_lock.unlock();
+        const auto publish_status = PublishTable(
+            directory_,
+            generation->generation,
+            generation->memtable,
+            options_,
+            *environment_,
+            &published
+        );
+        state_lock.lock();
+        if (!publish_status.ok()) {
+            return publish_status;
+        }
+        if (immutable_.get() != generation) {
+            return DatabaseCorruption(
+                "Immutable generation changed during background Flush"
+            );
+        }
+        immutable_->pending_table = std::move(published);
+    }
+    auto work_status = ContinueFlush();
+    if (!work_status.ok()) {
+        return work_status;
+    }
+    if (had_immutable) {
+        ++background_statistics_.flushes_completed;
+    }
+
+    const std::size_t level_zero_tables = static_cast<std::size_t>(std::count_if(
+        version_.tables().begin(),
+        version_.tables().end(),
+        [](const VersionTable& table) { return table.level == 0; }
+    ));
+    if (!stop_background_ && mutable_.empty() && immutable_ == nullptr &&
+        level_zero_tables >= options_.level0_compaction_trigger) {
+        work_status = PrepareCompaction();
+        if (!work_status.ok()) {
+            return work_status;
+        }
+        if (compaction_ != nullptr) {
+            work_status = ContinueCompaction(nullptr);
+            if (!work_status.ok()) {
+                return work_status;
+            }
+            ++background_statistics_.compactions_completed;
+        }
+    }
+    return Status::Ok();
+}
+
+void Database::BackgroundLoop() {
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    for (;;) {
+        background_cv_.wait(lock, [this] {
+            return stop_background_ || background_work_requested_;
+        });
+        if (stop_background_) {
+            return;
+        }
+        background_work_requested_ = false;
+        background_work_running_ = true;
+        background_statistics_.work_scheduled = false;
+        background_statistics_.work_running = true;
+
+        const auto work_status = RunBackgroundWorkLocked(lock);
+        background_status_ = work_status;
+        if (!work_status.ok()) {
+            ++background_statistics_.failures;
+        }
+
+        background_work_running_ = false;
+        background_statistics_.work_running = false;
+        background_cv_.notify_all();
+    }
+}
+
+Status Database::WaitForBackgroundWork() {
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    if (!IsRunningLocked()) {
+        return Status::Closed("database is not running");
+    }
+    background_cv_.wait(lock, [this] {
+        return !background_work_requested_ && !background_work_running_;
+    });
+    return background_status_;
+}
+
+Status Database::Close() {
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    if (state_ == DatabaseState::kClosed) {
+        return close_status_;
+    }
+    if (state_ == DatabaseState::kClosing) {
+        lifecycle_cv_.wait(lock, [this] {
+            return state_ == DatabaseState::kClosed;
+        });
+        return close_status_;
+    }
+
+    state_ = DatabaseState::kClosing;
+    stop_background_ = true;
+    background_cv_.notify_all();
+    lock.unlock();
+    if (background_thread_.joinable()) {
+        background_thread_.join();
+    }
+    lock.lock();
+
+    Status result = Status::Ok();
+    if (compaction_ != nullptr) {
+        result = ContinueCompaction(nullptr);
+    }
+    if (result.ok() && immutable_ != nullptr) {
+        result = ContinueFlush();
+    }
+    if (result.ok() && !mutable_.empty()) {
+        result = FreezeMutable(false);
+        if (result.ok()) {
+            result = ContinueFlush();
+        }
+    }
+    wal_.reset();
+    lock_.reset();
+    close_status_ = result;
+    state_ = DatabaseState::kClosed;
+    background_work_requested_ = false;
+    background_work_running_ = false;
+    background_statistics_.work_scheduled = false;
+    background_statistics_.work_running = false;
+    background_cv_.notify_all();
+    lifecycle_cv_.notify_all();
+    return close_status_;
+}
 
 Status Database::Put(
     std::string_view key,
@@ -445,8 +664,16 @@ LookupResult Database::Get(
     std::string_view key,
     DatabaseReadStats* operation_stats
 ) const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
     DatabaseReadStats operation;
     operation.point_lookups = 1;
+    if (!IsRunningLocked()) {
+        return FinishRead(
+            {Status::Closed("database is not running"), 0, ValueType::kValue, {}},
+            operation,
+            operation_stats
+        );
+    }
     auto result = mutable_.Lookup(key);
     if (!result.status.IsNotFound()) {
         if (result.status.ok()) {
@@ -514,6 +741,10 @@ Status Database::Write(
     if (!validation.ok()) {
         return validation;
     }
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    if (!IsRunningLocked()) {
+        return Status::Closed("database is not running");
+    }
     if (!status_.ok()) {
         return status_;
     }
@@ -521,24 +752,35 @@ Status Database::Write(
         write_options.sync_mode != SyncMode::kAsync) {
         return Status::InvalidArgument("write sync mode is invalid");
     }
-    if (compaction_ != nullptr) {
+    if (!options_.background_maintenance && compaction_ != nullptr) {
         const auto compaction_status = ContinueCompaction(nullptr);
         if (!compaction_status.ok()) {
             return compaction_status;
         }
     }
-    if (immutable_ != nullptr) {
+    if (!options_.background_maintenance && immutable_ != nullptr) {
         const auto flush_status = ContinueFlush();
         if (!flush_status.ok()) {
             return flush_status;
         }
     }
-    if (!mutable_.empty() &&
+    if (!options_.background_maintenance && !mutable_.empty() &&
         mutable_.ApproximateDataSize() >= options_.memtable_size_limit) {
-        const auto flush_status = Flush();
+        const auto flush_status = FlushLocked();
         if (!flush_status.ok()) {
             return flush_status;
         }
+    }
+    while (options_.background_maintenance && immutable_ != nullptr &&
+           mutable_.ApproximateDataSize() >= options_.memtable_size_limit &&
+           background_status_.ok() && IsRunningLocked()) {
+        background_cv_.wait(lock);
+    }
+    if (!IsRunningLocked()) {
+        return Status::Closed("database is not running");
+    }
+    if (options_.background_maintenance && !background_status_.ok()) {
+        return background_status_;
     }
     if (last_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
         return Status::InvalidArgument("sequence number space is exhausted");
@@ -565,12 +807,38 @@ Status Database::Write(
     }
 
     if (mutable_.ApproximateDataSize() >= options_.memtable_size_limit) {
-        return Flush();
+        if (!options_.background_maintenance) {
+            return FlushLocked();
+        }
+        if (immutable_ == nullptr) {
+            const auto freeze_status = FreezeMutable(true);
+            if (!freeze_status.ok()) {
+                background_status_ = freeze_status;
+                ++background_statistics_.failures;
+            }
+            ScheduleBackgroundWorkLocked();
+        }
     }
     return Status::Ok();
 }
 
 Status Database::Flush() {
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    if (!IsRunningLocked()) {
+        return Status::Closed("database is not running");
+    }
+    background_cv_.wait(lock, [this] {
+        return !background_work_running_;
+    });
+    const auto result = FlushLocked();
+    if (result.ok()) {
+        background_status_ = Status::Ok();
+    }
+    background_cv_.notify_all();
+    return result;
+}
+
+Status Database::FlushLocked() {
     if (!status_.ok()) {
         return status_;
     }
@@ -584,7 +852,7 @@ Status Database::Flush() {
         if (mutable_.empty()) {
             return Status::Ok();
         }
-        const auto freeze_status = FreezeMutable();
+        const auto freeze_status = FreezeMutable(false);
         if (!freeze_status.ok()) {
             return freeze_status;
         }
@@ -593,6 +861,25 @@ Status Database::Flush() {
 }
 
 Status Database::Compact(CompactionStats* stats) {
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    if (!IsRunningLocked()) {
+        if (stats != nullptr) {
+            *stats = {};
+        }
+        return Status::Closed("database is not running");
+    }
+    background_cv_.wait(lock, [this] {
+        return !background_work_running_;
+    });
+    const auto result = CompactLocked(stats);
+    if (result.ok()) {
+        background_status_ = Status::Ok();
+    }
+    background_cv_.notify_all();
+    return result;
+}
+
+Status Database::CompactLocked(CompactionStats* stats) {
     if (stats != nullptr) {
         *stats = {};
     }
@@ -603,7 +890,7 @@ Status Database::Compact(CompactionStats* stats) {
         return ContinueCompaction(stats);
     }
     if (immutable_ != nullptr || !mutable_.empty()) {
-        const auto flush_status = Flush();
+        const auto flush_status = FlushLocked();
         if (!flush_status.ok()) {
             return flush_status;
         }
@@ -834,7 +1121,8 @@ Status Database::ContinueCompaction(CompactionStats* stats) {
     return Status::Ok();
 }
 
-std::size_t Database::level_table_count(std::uint32_t level) const noexcept {
+std::size_t Database::level_table_count(std::uint32_t level) const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
     return static_cast<std::size_t>(std::count_if(
         version_.tables().begin(),
         version_.tables().end(),
@@ -842,7 +1130,71 @@ std::size_t Database::level_table_count(std::uint32_t level) const noexcept {
     ));
 }
 
-Status Database::FreezeMutable() {
+std::uint64_t Database::last_sequence() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return last_sequence_;
+}
+
+std::uint64_t Database::mutable_generation() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return mutable_generation_;
+}
+
+std::size_t Database::mutable_size() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return mutable_.ApproximateDataSize();
+}
+
+bool Database::has_immutable() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return immutable_ != nullptr;
+}
+
+std::size_t Database::flushed_table_count() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return tables_.size();
+}
+
+std::uint64_t Database::version_id() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return version_.id();
+}
+
+DatabaseReadStats Database::read_statistics() const {
+    std::lock_guard<std::mutex> lock(statistics_mutex_);
+    return read_statistics_;
+}
+
+CompactionStats Database::last_compaction_statistics() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return last_compaction_statistics_;
+}
+
+BackgroundMaintenanceStats Database::background_statistics() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return background_statistics_;
+}
+
+Status Database::background_status() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return background_status_;
+}
+
+DatabaseState Database::state() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return state_;
+}
+
+Status Database::status() const {
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return status_;
+}
+
+bool Database::IsRunningLocked() const noexcept {
+    return state_ == DatabaseState::kRunning;
+}
+
+Status Database::FreezeMutable(bool open_next_wal) {
     if (immutable_ != nullptr || mutable_.empty() || wal_ == nullptr) {
         return Status::InvalidArgument("Mutable MemTable cannot be frozen");
     }
@@ -858,6 +1210,9 @@ Status Database::FreezeMutable() {
     );
     ++mutable_generation_;
     mutable_ = MemTable(options_);
+    if (open_next_wal) {
+        return OpenMutableWal();
+    }
     return Status::Ok();
 }
 
@@ -889,7 +1244,7 @@ Status Database::ContinueFlush() {
         VersionEdit edit;
         edit.added_tables.push_back(std::move(added));
         edit.next_file_number = mutable_generation_;
-        edit.last_sequence = last_sequence_;
+        edit.last_sequence = immutable_->maximum_sequence;
         Version candidate;
         auto status = version_.Apply(edit, options_, &candidate);
         if (!status.ok()) {
@@ -967,6 +1322,7 @@ LookupResult Database::FinishRead(
     const DatabaseReadStats& operation,
     DatabaseReadStats* operation_stats
 ) const {
+    std::lock_guard<std::mutex> lock(statistics_mutex_);
     AccumulateDatabaseStats(operation, &read_statistics_);
     if (operation_stats != nullptr) {
         *operation_stats = operation;
