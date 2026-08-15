@@ -3,9 +3,8 @@
 #include <string_view>
 
 namespace minikv {
-namespace {
 
-std::string_view CodeName(StatusCode code) {
+std::string_view StatusCodeName(StatusCode code) noexcept {
     switch (code) {
         case StatusCode::kOk:
             return "OK";
@@ -26,8 +25,6 @@ std::string_view CodeName(StatusCode code) {
     }
     return "Unknown";
 }
-
-}  // namespace
 
 Status Status::Ok() {
     return {};
@@ -62,7 +59,7 @@ Status Status::Closed(std::string message) {
 }
 
 std::string Status::ToString() const {
-    const std::string name(CodeName(code_));
+    const std::string name(StatusCodeName(code_));
     if (message_.empty()) {
         return name;
     }

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.9.0
+    VERSION 0.10.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -145,4 +145,16 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_concurrency_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_concurrency_test)
     add_test(NAME concurrency COMMAND minikv_concurrency_test)
+
+    add_executable(minikv_reliability_test tests/reliability_test.cpp)
+    target_link_libraries(minikv_reliability_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_reliability_test)
+    add_test(NAME reliability COMMAND minikv_reliability_test)
+
+    add_executable(minikv_format_fuzz_test tests/format_fuzz_test.cpp)
+    target_link_libraries(minikv_format_fuzz_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_format_fuzz_test)
+    add_test(NAME format_fuzz COMMAND minikv_format_fuzz_test)
+
+    set_tests_properties(reliability format_fuzz PROPERTIES TIMEOUT 180)
 endif()

@@ -7,8 +7,8 @@ reproducible correctness tests.
 
 ## Current status
 
-V9 adds opt-in background maintenance, in-process read/write coordination, and
-an explicit shutdown lifecycle on top of the V8 scan engine:
+V10 hardens the V9 background-maintenance engine with reproducible model,
+crash, format-fuzz, and bounded concurrency stress tests:
 
 - binary-safe keys and values with configurable size limits;
 - monotonically increasing sequence numbers and last-write-wins semantics;
@@ -81,15 +81,26 @@ an explicit shutdown lifecycle on top of the V8 scan engine:
   single Immutable slot is occupied;
 - an idempotent `Running -> Closing -> Closed` lifecycle whose Close path
   stops the worker and Flushes committed Mutable data;
+- fixed, explicitly numbered `std::uint8_t` status categories plus
+  `StatusCodeName` and category predicates for external adapters;
 - a read-only `minikv_sstable_dump` diagnostic utility;
-- deterministic random-model tests, exhaustive one-byte SSTable and MANIFEST
-  corruption, per-stage Flush and Compaction publication failures, real
-  SIGKILL commit-boundary tests, lock-conflict tests, restart tests, and
-  sanitizer build options.
+- a 20,000-operation reference model spanning point/range reads, Flush,
+  Compaction, Close, and reopen;
+- eight deterministic SIGKILL rounds proving every acknowledged strict write
+  survives abrupt termination;
+- bounded four-writer/four-reader stress with background Flush/Compaction,
+  final model comparison, and restart verification;
+- same-key concurrent-write verification against the greatest serialized
+  Sequence number;
+- 30,000 arbitrary decoder inputs, 12,000 mutations of valid format corpora,
+  and 750 mutated SSTable files under fixed seeds;
+- exhaustive one-byte SSTable and MANIFEST corruption, per-stage Flush and
+  Compaction publication failures, real commit-boundary SIGKILL tests,
+  lock-conflict tests, restart tests, and sanitizer build options.
 
 Background maintenance is disabled by default so existing applications retain
-foreground timing until they opt in. V9 still supports only one Immutable
-generation, L0, and non-overlapping L1; it does not provide MVCC, multi-key
+foreground timing until they opt in. V10 retains only one Immutable generation,
+L0, and non-overlapping L1; it does not provide MVCC, multi-key
 transactions, lock-free maintenance, compression, or an automatic
 storage-format upgrade path. Unsupported directory formats are rejected;
 migration must be an explicit offline operation.
@@ -103,6 +114,12 @@ maximum. `Put` is an upsert. `Delete` writes a new tombstone and succeeds even
 when no visible value currently exists. `Get` distinguishes NotFound from a
 successfully stored empty value through `Status`.
 
+`StatusCode` values are a stable public contract: existing numeric values must
+not be reordered, while human-readable details remain in `Status::message()`.
+Callers can branch on `Status::code()`, category predicates such as
+`IsCorruption()`, or `StatusCodeName()`; they never need to parse an English
+error string.
+
 Scan ordering is the same bytewise lexicographic ordering used by MemTable and
 SSTable records. Range scans use the half-open interval `[begin,end)`; an empty
 begin is unbounded below and an absent end is unbounded above. Prefix scans are
@@ -110,11 +127,11 @@ globally ordered within the prefix, and an empty prefix is the deterministic
 load-all operation. Every scan has a positive limit no greater than
 `Options::maximum_scan_entries`, which defaults to 1,000.
 
-V9 serializes Put/Delete, Version publication, and lifecycle transitions with
+MiniKV serializes Put/Delete, Version publication, and lifecycle transitions with
 one exclusive database lock. Get and Scan use a shared lock, so readers can run
 concurrently and each operation sees a stable state for its complete call.
 Maintenance publication waits for active readers, and readers never observe a
-half-switched Version. A long Scan can delay Version publication, and V9 does
+half-switched Version. A long Scan can delay Version publication, and MiniKV does
 not claim an MVCC or cross-call range snapshot.
 
 A continuation token can be reused after restart while both its logical and
@@ -513,6 +530,24 @@ Run it directly with:
 ./build/minikv_concurrency_test
 ```
 
+The V10 reliability target uses fixed seeds and prints them before execution.
+It checks a long `std::map` reference model across maintenance and restart,
+strict-write recovery after coordinated SIGKILL, bounded multi-reader and
+multi-writer pressure, and same-key Sequence ordering:
+
+```bash
+./build/minikv_reliability_test
+```
+
+The format-fuzz target checks the stable status-code contract, current golden
+formats, explicit rejection of unsupported formats, arbitrary byte strings,
+mutated valid corpora, and mutated SSTable files. It is deterministic rather
+than coverage-guided, so every CI failure is directly reproducible:
+
+```bash
+./build/minikv_format_fuzz_test
+```
+
 ## Build and test
 
 Requirements:
@@ -591,7 +626,7 @@ The roadmap is incremental:
 10. V9: background Flush/Compaction, single-writer/multi-reader coordination,
     stable scan views, and idempotent shutdown (complete).
 11. V10: model, fault, crash, format-compatibility, fuzz, and concurrency stress
-    testing with stable error categories.
+    testing with stable error categories (complete).
 12. V11: reproducible workloads, latency percentiles, amplification metrics,
     one measured optimization cycle, and installable package/API stabilization.
 
