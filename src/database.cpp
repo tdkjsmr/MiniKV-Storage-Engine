@@ -164,6 +164,9 @@ Status Database::OpenWithEnvironment(
     if (directory.empty() || environment == nullptr ||
         options.memtable_size_limit == 0 ||
         options.compaction_output_size_limit == 0 ||
+        options.maximum_scan_entries == 0 ||
+        options.maximum_scan_entries >=
+            std::numeric_limits<std::uint32_t>::max() ||
         options.max_key_size == 0 ||
         options.max_key_size > std::numeric_limits<std::uint32_t>::max() ||
         options.max_value_size > std::numeric_limits<std::uint32_t>::max() ||

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,6 +52,43 @@ struct SSTableReadStats {
     std::uint64_t bytes_read = 0;
 };
 
+class SSTableReader;
+
+class SSTableIterator {
+public:
+    SSTableIterator(const SSTableIterator&) = delete;
+    SSTableIterator& operator=(const SSTableIterator&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
+    [[nodiscard]] const MemTableRecord* record() const noexcept;
+    [[nodiscard]] const SSTableReadStats& statistics() const noexcept {
+        return statistics_;
+    }
+    Status Next();
+
+private:
+    friend class SSTableReader;
+
+    SSTableIterator(
+        const SSTableReader* reader,
+        std::string begin,
+        std::optional<std::string> end
+    );
+
+    Status Initialize();
+    Status LoadBlock(std::size_t block);
+    void EnforceUpperBound();
+
+    const SSTableReader* reader_ = nullptr;
+    std::string begin_;
+    std::optional<std::string> end_;
+    std::vector<MemTableRecord> records_;
+    std::size_t block_ = 0;
+    std::size_t record_ = 0;
+    bool valid_ = false;
+    SSTableReadStats statistics_;
+};
+
 // Keeps only verified metadata and the sparse index in memory. Data blocks are
 // read from the immutable file for each point lookup.
 class SSTableReader {
@@ -76,12 +114,22 @@ public:
         std::vector<MemTableRecord>* records
     ) const;
 
+    // Creates a forward iterator positioned at the first key in [begin, end).
+    // Only one data block is retained by the iterator at a time.
+    Status NewIterator(
+        std::string_view begin,
+        std::optional<std::string_view> end,
+        std::unique_ptr<SSTableIterator>* output
+    ) const;
+
     [[nodiscard]] const SSTableMetadata& metadata() const noexcept {
         return metadata_;
     }
     [[nodiscard]] const std::string& path() const noexcept { return path_; }
 
 private:
+    friend class SSTableIterator;
+
     struct IndexEntry {
         std::string first_key;
         std::uint64_t block_offset = 0;

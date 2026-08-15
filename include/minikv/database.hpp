@@ -12,6 +12,7 @@
 #include "minikv/manifest.hpp"
 #include "minikv/memtable.hpp"
 #include "minikv/options.hpp"
+#include "minikv/scan.hpp"
 #include "minikv/status.hpp"
 #include "minikv/table.hpp"
 #include "minikv/wal.hpp"
@@ -87,6 +88,16 @@ public:
     [[nodiscard]] LookupResult Get(
         std::string_view key,
         DatabaseReadStats* operation_stats = nullptr
+    ) const;
+    [[nodiscard]] ScanResult Scan(const ScanOptions& scan_options) const;
+    [[nodiscard]] ScanResult ScanPrefix(
+        std::string_view prefix,
+        std::size_t limit = 100,
+        std::string_view continuation_token = {}
+    ) const;
+    [[nodiscard]] ScanResult LoadAll(
+        std::size_t limit = 100,
+        std::string_view continuation_token = {}
     ) const;
 
     // V3 flushes in the foreground. On failure, the immutable generation and

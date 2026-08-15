@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.7.0
+    VERSION 0.8.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -59,6 +59,7 @@ add_library(
     src/memtable.cpp
     src/manifest.cpp
     src/recovery.cpp
+    src/scan.cpp
     src/status.cpp
     src/table.cpp
     src/wal.cpp
@@ -131,4 +132,9 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_compaction_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_compaction_test)
     add_test(NAME compaction COMMAND minikv_compaction_test)
+
+    add_executable(minikv_range_scan_test tests/range_scan_test.cpp)
+    target_link_libraries(minikv_range_scan_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_range_scan_test)
+    add_test(NAME range_scan COMMAND minikv_range_scan_test)
 endif()

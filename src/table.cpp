@@ -856,4 +856,149 @@ Status SSTableReader::ReadRecords(
     return Status::Ok();
 }
 
+SSTableIterator::SSTableIterator(
+    const SSTableReader* reader,
+    std::string begin,
+    std::optional<std::string> end
+)
+    : reader_(reader), begin_(std::move(begin)), end_(std::move(end)) {
+    statistics_.tables_considered = 1;
+}
+
+const MemTableRecord* SSTableIterator::record() const noexcept {
+    if (!valid_ || record_ >= records_.size()) {
+        return nullptr;
+    }
+    return &records_[record_];
+}
+
+Status SSTableIterator::LoadBlock(std::size_t block) {
+    records_.clear();
+    record_ = 0;
+    if (reader_ == nullptr || block >= reader_->index_.size()) {
+        valid_ = false;
+        return Status::Ok();
+    }
+    block_ = block;
+    const auto status = reader_->ReadBlock(block_, &records_, &statistics_);
+    if (!status.ok()) {
+        valid_ = false;
+        records_.clear();
+        return status;
+    }
+    valid_ = !records_.empty();
+    return Status::Ok();
+}
+
+void SSTableIterator::EnforceUpperBound() {
+    const auto* current = record();
+    if (current != nullptr && end_.has_value() && current->key >= *end_) {
+        valid_ = false;
+        records_.clear();
+        record_ = 0;
+    }
+}
+
+Status SSTableIterator::Initialize() {
+    if (reader_ == nullptr || reader_->index_.empty()) {
+        return Status::InvalidArgument("SSTable iterator has no reader");
+    }
+    if (reader_->metadata_.maximum_key < begin_ ||
+        (end_.has_value() && reader_->metadata_.minimum_key >= *end_) ||
+        (end_.has_value() && begin_ == *end_)) {
+        valid_ = false;
+        return Status::Ok();
+    }
+
+    std::size_t first_block = 0;
+    if (!begin_.empty()) {
+        const auto upper = std::upper_bound(
+            reader_->index_.begin(),
+            reader_->index_.end(),
+            begin_,
+            [](std::string_view target, const SSTableReader::IndexEntry& entry) {
+                return target < entry.first_key;
+            }
+        );
+        if (upper != reader_->index_.begin()) {
+            first_block = static_cast<std::size_t>(
+                std::distance(reader_->index_.begin(), std::prev(upper))
+            );
+        }
+    }
+
+    auto status = LoadBlock(first_block);
+    if (!status.ok()) {
+        return status;
+    }
+    record_ = static_cast<std::size_t>(std::distance(
+        records_.begin(),
+        std::lower_bound(
+            records_.begin(),
+            records_.end(),
+            begin_,
+            [](const MemTableRecord& record, std::string_view target) {
+                return record.key < target;
+            }
+        )
+    ));
+    while (record_ >= records_.size()) {
+        status = LoadBlock(block_ + 1U);
+        if (!status.ok() || !valid_) {
+            return status;
+        }
+    }
+    valid_ = true;
+    EnforceUpperBound();
+    return Status::Ok();
+}
+
+Status SSTableIterator::Next() {
+    if (!valid_) {
+        return Status::Ok();
+    }
+    ++record_;
+    while (record_ >= records_.size()) {
+        const auto status = LoadBlock(block_ + 1U);
+        if (!status.ok() || !valid_) {
+            return status;
+        }
+    }
+    EnforceUpperBound();
+    return Status::Ok();
+}
+
+Status SSTableReader::NewIterator(
+    std::string_view begin,
+    std::optional<std::string_view> end,
+    std::unique_ptr<SSTableIterator>* output
+) const {
+    if (output == nullptr) {
+        return Status::InvalidArgument("SSTable iterator output must not be null");
+    }
+    output->reset();
+    if (begin.size() > options_.max_key_size ||
+        (end.has_value() && end->size() > options_.max_key_size)) {
+        return Status::InvalidArgument("SSTable iterator bound is too large");
+    }
+    if (end.has_value() && begin > *end) {
+        return Status::InvalidArgument("SSTable iterator range is reversed");
+    }
+    std::optional<std::string> owned_end;
+    if (end.has_value()) {
+        owned_end = std::string(*end);
+    }
+    auto iterator = std::unique_ptr<SSTableIterator>(new SSTableIterator(
+        this,
+        std::string(begin),
+        std::move(owned_end)
+    ));
+    const auto status = iterator->Initialize();
+    if (!status.ok()) {
+        return status;
+    }
+    *output = std::move(iterator);
+    return Status::Ok();
+}
+
 }  // namespace minikv

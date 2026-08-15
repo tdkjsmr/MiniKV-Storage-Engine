@@ -12,6 +12,7 @@ struct Options {
     static constexpr double kDefaultBloomFalsePositiveRate = 0.01;
     static constexpr std::size_t kDefaultCompactionOutputSizeLimit =
         2U * 1024U * 1024U;
+    static constexpr std::size_t kDefaultMaximumScanEntries = 1000;
 
     std::size_t max_key_size = kDefaultMaxKeySize;
     std::size_t max_value_size = kDefaultMaxValueSize;
@@ -21,6 +22,7 @@ struct Options {
     double bloom_false_positive_rate = kDefaultBloomFalsePositiveRate;
     std::size_t compaction_output_size_limit =
         kDefaultCompactionOutputSizeLimit;
+    std::size_t maximum_scan_entries = kDefaultMaximumScanEntries;
 };
 
 }  // namespace minikv

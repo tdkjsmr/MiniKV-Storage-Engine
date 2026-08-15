@@ -7,8 +7,8 @@ reproducible correctness tests.
 
 ## Current status
 
-V7 adds foreground L0-to-L1 compaction on top of the V6 Bloom-filtered,
-indexed SSTable read path and authoritative Version model:
+V8 adds bounded deterministic range and prefix scans on top of the V7
+two-level compaction engine:
 
 - binary-safe keys and values with configurable size limits;
 - monotonically increasing sequence numbers and last-write-wins semantics;
@@ -63,18 +63,47 @@ indexed SSTable read path and authoritative Version model:
   input, followed by input-file removal only after old readers are released;
 - per-compaction input/output file, record, byte, duplicate, tombstone,
   elapsed-time, and reclaimed-byte statistics;
+- bytewise globally ordered `Scan([begin,end))` and `ScanPrefix` across
+  Mutable, Immutable, L0, and L1 sources;
+- one-block-at-a-time SSTable iterators that seek through the sparse index;
+- strict configurable result limits, explicit truncation, and opaque
+  CRC32C-protected continuation tokens bound to their range and database state;
+- scan statistics for sources and tables considered, data blocks and bytes
+  read, records examined, obsolete versions collapsed, and tombstones hidden;
 - a read-only `minikv_sstable_dump` diagnostic utility;
 - deterministic random-model tests, exhaustive one-byte SSTable and MANIFEST
   corruption, per-stage Flush and Compaction publication failures, real
   SIGKILL commit-boundary tests, lock-conflict tests, restart tests, and
   sanitizer build options.
 
-V7 still uses foreground Flush and manual foreground Compaction. It supports
+V8 still uses foreground Flush and manual foreground Compaction. It supports
 only L0 and non-overlapping L1, not a general multi-level compaction policy. It
-does not yet have range scans, background work, in-process concurrent calls,
-compression, or an automatic storage-format upgrade path. Statistics are not
-yet concurrency-safe. Unsupported directory formats are rejected; migration
-must be an explicit offline operation.
+does not yet have background work, in-process concurrent calls, compression,
+or an automatic storage-format upgrade path. Statistics are not yet
+concurrency-safe. Unsupported directory formats are rejected; migration must
+be an explicit offline operation.
+
+## Public data model and operation semantics
+
+Keys and values are arbitrary byte strings represented by `std::string` and
+`std::string_view`; they are not required to be UTF-8. Keys are non-empty and
+default to a 64 KiB maximum. Values may be empty and default to a 4 MiB
+maximum. `Put` is an upsert. `Delete` writes a new tombstone and succeeds even
+when no visible value currently exists. `Get` distinguishes NotFound from a
+successfully stored empty value through `Status`.
+
+Scan ordering is the same bytewise lexicographic ordering used by MemTable and
+SSTable records. Range scans use the half-open interval `[begin,end)`; an empty
+begin is unbounded below and an absent end is unbounded above. Prefix scans are
+globally ordered within the prefix, and an empty prefix is the deterministic
+load-all operation. Every scan has a positive limit no greater than
+`Options::maximum_scan_entries`, which defaults to 1,000.
+
+V8 remains single-threaded. One scan call observes the Database state at that
+call. A continuation token can be reused after restart while the logical state
+is unchanged, but any successful Put/Delete or Version-changing Flush/
+Compaction makes it explicitly stale. V9 will introduce synchronization and
+stable views for concurrent calls; V8 does not claim a cross-mutation snapshot.
 
 ## WAL format version 1
 
@@ -346,6 +375,48 @@ directly with:
 ./build/minikv_compaction_test
 ```
 
+## Range and prefix scans
+
+`Database::Scan` merges one ordered cursor per live source. Mutable and
+Immutable MemTables are bounded by their configured size. Every SSTable cursor
+uses its sparse index to seek near `begin` and retains one verified data block
+at a time. A minimum heap chooses the next User Key; for duplicate keys, the
+greatest Sequence wins, and a winning tombstone suppresses the key. Bloom
+filters are intentionally not used for range traversal.
+
+```cpp
+minikv::ScanOptions options;
+options.begin = "build:";
+options.end = "build;";  // Exclusive.
+options.limit = 100;
+
+minikv::ScanResult page = database->Scan(options);
+if (page.status.ok() && page.truncated) {
+    options.continuation_token = page.continuation_token;
+    minikv::ScanResult next_page = database->Scan(options);
+}
+
+minikv::ScanResult prefix_page = database->ScanPrefix("build:", 100);
+minikv::ScanResult all_page = database->LoadAll(100);
+```
+
+The continuation token is an opaque binary string. It contains format and
+length fields, the canonical range, the last returned key, Version id and
+Sequence frontier, plus a CRC32C. Callers should store or transport it as an
+opaque value; a text protocol can encode it as base64. A token is returned only
+when `truncated` is true, and resumption is strictly after the last returned
+key, preventing duplicates between unchanged pages.
+
+The V8 suite covers sparse-index seeks, multi-block iteration, binary bounds,
+all-`0xff` prefixes, every in-memory/on-disk source, failed-Flush Immutable
+visibility, strict limits, changed page sizes, restart continuation, every
+single-byte token mutation and truncation, stale tokens, a 500-operation model,
+Flush/Compaction, restart, and post-Open SSTable corruption. Run it directly:
+
+```bash
+./build/minikv_range_scan_test
+```
+
 ## Build and test
 
 Requirements:
@@ -400,6 +471,9 @@ flowchart LR
     R[Get] --> M
     R --> I
     R --> S
+    X[Range / Prefix Scan] --> M
+    X --> I
+    X --> S
 ```
 
 The roadmap is incremental:
@@ -413,7 +487,8 @@ The roadmap is incremental:
    locking.
 7. V6: Bloom filters and read-path statistics (complete).
 8. V7: semantics-preserving L0-to-L1 Compaction (complete).
-9. V8: bounded deterministic range/prefix scans and continuation tokens.
+9. V8: bounded deterministic range/prefix scans and continuation tokens
+   (complete).
 10. V9: background Flush/Compaction, single-writer/multi-reader coordination,
     stable scan views, and idempotent shutdown.
 11. V10: model, fault, crash, format-compatibility, fuzz, and concurrency stress
