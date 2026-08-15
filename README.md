@@ -1,684 +1,85 @@
+[English](README.md) | [中文](README_zh.md)
+
 # MiniKV Storage Engine
 
-MiniKV is a small embedded key-value storage engine written in C++17 for
-Linux. Its LSM-style design emphasizes explicit durability semantics, crash
-recovery, immutable on-disk structures, boundary-checked parsing, and
-reproducible correctness tests.
-
-## Current status
-
-V11 completes the planned engine with reproducible performance workloads,
-measured amplification, an installable CMake package, and the V10 model,
-crash, format-fuzz, and bounded concurrency stress coverage:
-
-- binary-safe keys and values with configurable size limits;
-- monotonically increasing sequence numbers and last-write-wins semantics;
-- tombstones that prevent values in older generations from reappearing;
-- versioned, CRC32C-protected WAL records and strict or asynchronous writes;
-- recovery with safe repair of an incomplete final WAL record;
-- one active Mutable MemTable and at most one pending Immutable MemTable;
-- one WAL and, after Flush, one immutable SSTable per generation;
-- crash-safe publication ordered as temporary write, file sync, rename, and
-  directory sync;
-- immutable `Version` snapshots changed through validated `VersionEdit`s;
-- an atomically replaced, CRC32C-protected MANIFEST that records the live
-  SSTable set, levels, key and sequence bounds, next file number, and sequence
-  frontier;
-- startup driven only by MANIFEST references rather than inferred directory
-  contents;
-- rejection of missing referenced files and metadata disagreements as hard
-  corruption;
-- cleanup of unreferenced SSTables and interrupted temporary files;
-- an explicit directory storage-format version and `VersionMismatch` status
-  for unsupported or pre-MANIFEST directories;
-- a process-lifetime `LOCK` file acquired with non-blocking `flock`, preventing
-  two engine instances from mutating the same directory;
-- block-oriented, key-sorted SSTables with per-record and per-block checksums;
-- a sparse index containing each data block's first key, offset, and length;
-- a fixed-size Footer with 64-bit region offsets and sequence summaries;
-- per-SSTable Bloom filters sized from the expected key count and a configurable
-  target false-positive rate (1% by default);
-- range-first, Bloom-second, sparse-index-last point lookup, so a definite
-  Bloom miss performs no data-block read;
-- per-operation and lifetime-cumulative read statistics for MemTable hits,
-  tables considered, range and Bloom rejections, Bloom false positives, data
-  blocks read, and bytes read;
-- complete boundary checks and a 64 MiB index-memory cap before every offset,
-  length, allocation, and record
-  parse derived from disk bytes;
-- startup validation of every SSTable block before its covered WAL may be
-  removed;
-- memory-resident table metadata and sparse indexes, while point reads fetch
-  only one candidate data block from disk;
-- key-range rejection without a data-block read;
-- reads across Mutable, Immutable, and multiple SSTables, with the greatest
-  sequence number winning and tombstones converted to user-visible NotFound;
-- manual foreground compaction of every L0 file plus all L1 files overlapping
-  the selected key-range union;
-- minimum-heap multiway merge with greatest-sequence-wins duplicate collapse;
-- safe tombstone removal after selecting the complete bottommost range, with
-  deletion-only compactions allowed to produce no SSTable;
-- key-sorted L1 outputs split at a configurable approximate data-size target,
-  with validated non-overlapping L1 ranges;
-- one atomic `VersionEdit` that adds every compaction output and deletes every
-  input, followed by input-file removal only after old readers are released;
-- per-compaction input/output file, record, byte, duplicate, tombstone,
-  elapsed-time, and reclaimed-byte statistics;
-- bytewise globally ordered `Scan([begin,end))` and `ScanPrefix` across
-  Mutable, Immutable, L0, and L1 sources;
-- one-block-at-a-time SSTable iterators that seek through the sparse index;
-- strict configurable result limits, explicit truncation, and opaque
-  CRC32C-protected continuation tokens bound to their range and database state;
-- scan statistics for sources and tables considered, data blocks and bytes
-  read, records examined, obsolete versions collapsed, and tombstones hidden;
-- one serialized writer with any number of concurrent point or range readers;
-- an opt-in worker that Flushes one Immutable MemTable while the next WAL and
-  Mutable generation continue accepting writes;
-- recovery of the consecutive two-WAL state created by an in-progress
-  background Flush;
-- automatic L0-to-L1 Compaction at a configurable L0 file-count trigger;
-- concurrency-safe read and maintenance statistics;
-- observable, retryable background errors and writer backpressure when the
-  single Immutable slot is occupied;
-- an idempotent `Running -> Closing -> Closed` lifecycle whose Close path
-  stops the worker and Flushes committed Mutable data;
-- fixed, explicitly numbered `std::uint8_t` status categories plus
-  `StatusCodeName` and category predicates for external adapters;
-- a read-only `minikv_sstable_dump` diagnostic utility;
-- a 20,000-operation reference model spanning point/range reads, Flush,
-  Compaction, Close, and reopen;
-- eight deterministic SIGKILL rounds proving every acknowledged strict write
-  survives abrupt termination;
-- bounded four-writer/four-reader stress with background Flush/Compaction,
-  final model comparison, and restart verification;
-- same-key concurrent-write verification against the greatest serialized
-  Sequence number;
-- 30,000 arbitrary decoder inputs, 12,000 mutations of valid format corpora,
-  and 750 mutated SSTable files under fixed seeds;
-- a deterministic `minikv_benchmark` covering sequential and random writes,
-  hit and miss reads, 50/50 and 95/5 mixed traffic, and parallel reads;
-- throughput, end-to-end throughput, P50/P95/P99 latency, exact read
-  amplification, and clearly labelled estimated write and space amplification;
-- Bloom double hashes computed in one key pass while preserving every existing
-  hash value and serialized bit position;
-- semantic engine version `1.0.0` exposed separately from all on-disk format
-  versions;
-- standard `cmake --install` headers, static library, tools, exported
-  `minikv::minikv` target, versioned package config, TGZ packaging, and an
-  installed-consumer restart test;
-- exhaustive one-byte SSTable and MANIFEST corruption, per-stage Flush and
-  Compaction publication failures, real commit-boundary SIGKILL tests,
-  lock-conflict tests, restart tests, and sanitizer build options.
-
-Background maintenance is disabled by default so existing applications retain
-foreground timing until they opt in. V11 retains only one Immutable generation,
-L0, and non-overlapping L1; it does not provide MVCC, multi-key
-transactions, lock-free maintenance, compression, or an automatic
-storage-format upgrade path. Unsupported directory formats are rejected;
-migration must be an explicit offline operation.
-
-## Public data model and operation semantics
-
-Keys and values are arbitrary byte strings represented by `std::string` and
-`std::string_view`; they are not required to be UTF-8. Keys are non-empty and
-default to a 64 KiB maximum. Values may be empty and default to a 4 MiB
-maximum. `Put` is an upsert. `Delete` writes a new tombstone and succeeds even
-when no visible value currently exists. `Get` distinguishes NotFound from a
-successfully stored empty value through `Status`.
-
-`StatusCode` values are a stable public contract: existing numeric values must
-not be reordered, while human-readable details remain in `Status::message()`.
-Callers can branch on `Status::code()`, category predicates such as
-`IsCorruption()`, or `StatusCodeName()`; they never need to parse an English
-error string.
-
-Scan ordering is the same bytewise lexicographic ordering used by MemTable and
-SSTable records. Range scans use the half-open interval `[begin,end)`; an empty
-begin is unbounded below and an absent end is unbounded above. Prefix scans are
-globally ordered within the prefix, and an empty prefix is the deterministic
-load-all operation. Every scan has a positive limit no greater than
-`Options::maximum_scan_entries`, which defaults to 1,000.
-
-MiniKV serializes Put/Delete, Version publication, and lifecycle transitions with
-one exclusive database lock. Get and Scan use a shared lock, so readers can run
-concurrently and each operation sees a stable state for its complete call.
-Maintenance publication waits for active readers, and readers never observe a
-half-switched Version. A long Scan can delay Version publication, and MiniKV does
-not claim an MVCC or cross-call range snapshot.
-
-A continuation token can be reused after restart while both its logical and
-physical database state are unchanged. Successful Put/Delete or a
-Version-changing Flush/Compaction makes it explicitly stale. Normal Close may
-Flush a non-empty Mutable generation, so a token created before that Close can
-also become stale.
-
-## WAL format version 1
-
-Each WAL record has a fixed 32-byte header followed by the key and value:
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | Magic bytes `MKVW` |
-| 4 | 1 | Format version |
-| 5 | 1 | Record type: value or deletion |
-| 6 | 2 | Header size |
-| 8 | 4 | Total record size |
-| 12 | 8 | Sequence number |
-| 20 | 4 | Key size |
-| 24 | 4 | Value size |
-| 28 | 4 | CRC32C |
-| 32 | variable | Key bytes followed by value bytes |
-
-All integers are little-endian. The checksum covers header bytes `[0, 28)`
-and the complete payload. A deletion record must have an empty value.
-
-## Write, recovery, and durability semantics
-
-The write path is:
-
-```text
-validate input
-    -> allocate a sequence number
-    -> encode and completely append one WAL record
-    -> fdatasync in strict mode
-    -> update the Mutable MemTable
-```
-
-Strict mode is the default. If append or `fdatasync` fails, the operation is not
-made visible in the MemTable and the writer rejects later writes. Asynchronous
-mode skips `fdatasync` and may lose recently acknowledged writes after a crash.
-
-Recovery scans from byte zero, requires globally increasing sequence numbers,
-and verifies every complete record before replay. Only an incomplete final
-record is repairable: recovery truncates to the last verified boundary and
-calls `fdatasync`. Bad headers, checksums, or sequence order are hard
-corruption. Replay is transactional, so failed recovery exposes no partial
-MemTable.
-
-## MemTable generations and Flush
-
-Each generation uses a 20-digit file number:
-
-```text
-00000000000000000001.wal
-    -> Mutable generation 1 reaches its byte limit
-    -> Immutable generation 1
-    -> open and directory-sync generation 2 WAL
-    -> return the committed threshold write
-    -> background worker starts generation 1 Flush
-    -> 00000000000000000001.sst.tmp
-    -> fdatasync(table)
-    -> rename to 00000000000000000001.sst
-    -> fsync(database directory)
-    -> validate the published SSTable
-    -> apply one VersionEdit in memory
-    -> write MANIFEST.tmp and fdatasync it
-    -> rename MANIFEST.tmp to MANIFEST
-    -> fsync(database directory)
-    -> publish the new in-memory Version
-    -> remove generation 1 WAL
-    -> fsync(database directory)
-    -> retain generation 2 as the active WAL
-```
-
-The old WAL remains authoritative until the table is durable, validated, and
-referenced by a durable MANIFEST. Failed Flush work can be retried in process.
-After a crash, the old MANIFEST means the retained WAL is replayed and an
-unreferenced table is removed; the new MANIFEST means the table is loaded and
-the redundant old WAL is removed. A half-published in-memory Version is never
-observable.
-
-With `Options::background_maintenance=true`, the threshold-crossing write is
-committed to its WAL and MemTable, the generation is frozen, and the next WAL
-is synced before the worker builds the SSTable. SSTable construction runs
-without the database state lock, so reads and next-generation writes can
-progress. Manifest publication remains exclusively locked. If the next
-Mutable reaches its limit while the Immutable slot is occupied, the writer
-waits on a predicate loop until Flush completes, Close begins, or a background
-error occurs.
-
-The MANIFEST sequence frontier advances only through the maximum Sequence in
-the Immutable generation being published. It never claims newer records that
-still exist only in the next WAL. Recovery accepts either one active WAL or
-two consecutive WALs representing one Immutable plus one Mutable generation.
-All other WAL gaps or future generations are corruption.
-
-## Directory storage format and MANIFEST version 1
-
-The MANIFEST is the sole authority for the set of live SSTables. It is a full
-immutable Version snapshot. A `VersionEdit` may add and delete files together,
-but publication replaces the snapshot atomically instead of appending a record
-that could leave a torn tail.
-
-The fixed 64-byte header is:
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | Magic `MKMF` |
-| 4 | 1 | MANIFEST format version `1` |
-| 5 | 1 | Directory storage format version `2` |
-| 6 | 2 | Header size `64` |
-| 8 | 8 | Physical file size |
-| 16 | 8 | Monotonic Version id |
-| 24 | 8 | Next file number |
-| 32 | 8 | Last published sequence number |
-| 40 | 4 | Live-table count |
-| 44 | 4 | Table-record payload size |
-| 48 | 8 | Reserved, must be zero |
-| 56 | 4 | CRC32C of bytes `[0, 56)` and the complete payload |
-| 60 | 4 | Reserved, must be zero |
-
-Each variable table record contains:
-
-```text
-[record size: u32][level: u32][file number: u64][file size: u64]
-[record count: u64][minimum sequence: u64][maximum sequence: u64]
-[minimum key size: u32][maximum key size: u32][key bytes]
-```
-
-All integers are little-endian. Every length and count is validated before it
-controls allocation or slicing. The complete MANIFEST is capped at 64 MiB.
-On `Open`, every referenced table must exist, pass its own checksums, and agree
-with the MANIFEST summaries. Unreferenced SSTables never participate in reads.
-
-## SSTable format version 3
-
-The file layout is:
-
-```text
-[32-byte Header][Data Blocks][Sparse Index][Bloom Filter][104-byte Footer]
-```
-
-The fixed Header is:
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | Magic `MKST` |
-| 4 | 1 | Format version `3` |
-| 5 | 1 | Reserved |
-| 6 | 2 | Header size |
-| 8 | 8 | Generation |
-| 16 | 8 | Record count |
-| 24 | 4 | Data-block count |
-| 28 | 4 | CRC32C of bytes `[0, 28)` |
-
-Each data block has a 20-byte header followed by key-sorted WAL-format records:
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | Magic `MKDB` |
-| 4 | 4 | Total block size |
-| 8 | 4 | Record count |
-| 12 | 4 | Payload size |
-| 16 | 4 | CRC32C of bytes `[0, 16)` and the payload |
-| 20 | variable | Complete WAL-format records |
-
-The sparse index has a 20-byte `MKIX` header containing total size, entry count,
-payload size, and CRC32C. Every variable entry is:
-
-```text
-[key size: u32][absolute block offset: u64][block size: u32][first key bytes]
-```
-
-The fixed 104-byte Footer begins with `MKSF` and stores format and Footer sizes,
-physical file size, generation, record count, minimum and maximum sequence,
-data offset and size, index offset and size, Bloom offset and size, block count,
-and a CRC32C over Footer bytes `[0, 100)`.
-
-The Bloom region starts with this fixed 32-byte header and is followed by its
-bit array:
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | Magic `MKBF` |
-| 4 | 1 | Bloom format version `1` |
-| 5 | 1 | Hash-position count |
-| 6 | 2 | Header size `32` |
-| 8 | 4 | Total encoded Bloom size |
-| 12 | 8 | Bit count |
-| 20 | 8 | Inserted-key count |
-| 28 | 4 | CRC32C of bytes `[0, 28)` and the complete bit array |
-
-For expected key count `n` and target false-positive probability `p`, MiniKV
-uses `m = ceil(-n * ln(p) / ln(2)^2)` bits (byte-aligned, at least 64 bits) and
-`k = round((m / n) * ln(2))` hash positions, clamped to `[1, 30]`. Two stable
-64-bit hashes generate the `k` positions by double hashing. The serialized
-region is capped at 64 MiB.
-
-`SSTableReader::Open` validates the Bloom checksum and verifies every stored
-key against the decoded filter while it validates data blocks. This makes a
-false negative hard corruption even if an attacker also recomputes the Bloom
-checksum. `Options::bloom_filter_enabled` can disable filter construction and
-lookup for controlled comparisons; `bloom_false_positive_rate` defaults to
-`0.01`.
-
-`SSTableReader::Open` first reads the fixed Header and Footer, proves that all
-regions are contiguous and inside the physical file, validates and loads the
-sparse index and Bloom filter, and then streams through every block once for
-integrity and summary verification. It retains no data records. `Get` checks
-the table key range, then Bloom, binary-searches the sparse index, `pread`s one
-candidate block, revalidates it, and binary-searches its decoded records. I/O
-errors and corruption are never converted into NotFound.
-
-## Read statistics and Bloom experiment
-
-`Database::Get(key, &operation_stats)` returns counters for that one lookup.
-`Database::read_statistics()` returns counters accumulated since the current
-process opened the database. These are exact counters, not estimates; Bloom's
-configured and measured false-positive probabilities are statistical values.
-A Bloom false positive is counted only when Bloom says "may contain" and the
-verified candidate block does not contain the key.
-
-The deterministic Debug test inserts 10,000 keys into a filter targeting 1%
-and checks 100,000 distinct absent keys. The current stable-hash fixture
-observes 986 false positives (0.986%). A separate 5,000-query SSTable fixture
-(4,999 keys are in range) reads 54 data blocks with Bloom enabled and 4,999
-with it disabled.
-One local Debug run measured 2,652 microseconds versus 60,880 microseconds.
-Those timings are illustrative rather than a benchmark: filesystem cache,
-machine load, and build mode affect them. Reproduce both experiments with:
-
-```bash
-./build/minikv_bloom_filter_test
-```
-
-## L0-to-L1 compaction
-
-`Database::Compact` first flushes pending mutable data, then selects all L0
-tables. Their minimum-to-maximum key union determines which L1 tables overlap;
-endpoint equality counts as overlap. Selecting the complete overlapping range
-is what makes it safe in this two-level engine to remove a winning tombstone:
-there is no unselected older value for that key below L1. A future engine with
-deeper levels would have to retain the tombstone unless it proved those levels
-also contain no older value.
-
-Each input is already key-sorted. A minimum heap merges the current record from
-every input, and the greatest Sequence wins for equal user keys. Output is
-split using `Options::compaction_output_size_limit`, which defaults to 2 MiB of
-approximate record data. L1 ranges are validated as strictly non-overlapping.
-
-Publication uses this order:
-
-```text
-encode every output
-    -> write and fdatasync every .sst.tmp
-    -> rename every output SSTable
-    -> fsync database directory
-    -> reopen and validate every output
-    -> build one VersionEdit: add outputs + delete inputs
-    -> write, fdatasync, rename, and directory-sync MANIFEST
-    -> publish the new in-memory Version
-    -> release old input readers
-    -> remove input SSTables and obsolete empty WAL
-    -> fsync database directory
-```
-
-Before MANIFEST publication, the old Version remains authoritative and output
-files are harmless orphans. After publication, the new Version is authoritative
-and old inputs are harmless orphans. Startup removes whichever set is not
-referenced. Every step is retryable in process.
-
-```cpp
-minikv::CompactionStats stats;
-const minikv::Status status = database->Compact(&stats);
-if (status.ok()) {
-    // stats.input_bytes, stats.output_bytes, stats.bytes_reclaimed, ...
-}
-```
-
-The V7 suite covers duplicate keys across generations, Put-Delete-Put,
-Put-Delete, all-tombstone output, disjoint and equal-boundary ranges, output
-splitting, a deterministic reference model before/after/restart, 12 injected
-publication/cleanup failures, and six real SIGKILL commit boundaries. Run it
-directly with:
-
-```bash
-./build/minikv_compaction_test
-```
-
-## Range and prefix scans
-
-`Database::Scan` merges one ordered cursor per live source. Mutable and
-Immutable MemTables are bounded by their configured size. Every SSTable cursor
-uses its sparse index to seek near `begin` and retains one verified data block
-at a time. A minimum heap chooses the next User Key; for duplicate keys, the
-greatest Sequence wins, and a winning tombstone suppresses the key. Bloom
-filters are intentionally not used for range traversal.
-
-```cpp
-minikv::ScanOptions options;
-options.begin = "build:";
-options.end = "build;";  // Exclusive.
-options.limit = 100;
-
-minikv::ScanResult page = database->Scan(options);
-if (page.status.ok() && page.truncated) {
-    options.continuation_token = page.continuation_token;
-    minikv::ScanResult next_page = database->Scan(options);
-}
-
-minikv::ScanResult prefix_page = database->ScanPrefix("build:", 100);
-minikv::ScanResult all_page = database->LoadAll(100);
-```
-
-The continuation token is an opaque binary string. It contains format and
-length fields, the canonical range, the last returned key, Version id and
-Sequence frontier, plus a CRC32C. Callers should store or transport it as an
-opaque value; a text protocol can encode it as base64. A token is returned only
-when `truncated` is true, and resumption is strictly after the last returned
-key, preventing duplicates between unchanged pages.
-
-The V8 suite covers sparse-index seeks, multi-block iteration, binary bounds,
-all-`0xff` prefixes, every in-memory/on-disk source, failed-Flush Immutable
-visibility, strict limits, changed page sizes, restart continuation, every
-single-byte token mutation and truncation, stale tokens, a 500-operation model,
-Flush/Compaction, restart, and post-Open SSTable corruption. Run it directly:
-
-```bash
-./build/minikv_range_scan_test
-```
-
-## Background maintenance, concurrency, and Close
-
-Background work is opt-in and uses one worker per open Database:
-
-```cpp
-minikv::Options options;
-options.background_maintenance = true;
-options.level0_compaction_trigger = 4;
-
-std::unique_ptr<minikv::Database> database;
-minikv::DatabaseOpenResult opened;
-minikv::Status status = minikv::Database::Open(
-    "./data", options, &database, &opened
-);
-if (status.ok()) {
-    status = database->Put("key", "value");
-}
-if (status.ok()) {
-    status = database->WaitForBackgroundWork();
-}
-const auto maintenance = database->background_statistics();
-const minikv::Status close_status = database->Close();
-```
-
-The state lock is acquired shared by Get, Scan, and read-only state observers.
-Put/Delete, foreground maintenance, Version publication, and Close acquire it
-exclusively. The read-statistics mutex is taken only after the state lock and
-is never used to acquire the state lock. The worker uses the same exclusive
-state lock, but releases it while encoding and publishing the immutable table
-file; it reacquires the lock before publishing MANIFEST and changing Version.
-
-A threshold Put/Delete reports the WAL commit result, not a later worker
-result. Background errors are returned by `WaitForBackgroundWork()` and
-`background_status()`, increment `BackgroundMaintenanceStats::failures`, and
-remain retryable through foreground `Flush()`. Once the next Mutable reaches
-its limit, further writes wait rather than creating an unbounded Immutable
-queue. Any background error pauses new writes until a foreground Flush/Compact
-retry succeeds, preventing failed maintenance file numbers from overlapping a
-new generation. Automatic Compaction runs only when the just-completed Flush
-leaves the Mutable empty; otherwise it is deferred to a later maintenance
-opportunity.
-
-Close first transitions to Closing under the exclusive lock, so already active
-readers finish and no new operation can start. It wakes blocked writers, stops
-and joins the worker, retries an outstanding Immutable Flush, Flushes a
-non-empty Mutable, releases the process lock, and transitions to Closed. Close
-does not require Compaction. Repeated or concurrent Close calls return the same
-first result. A failed Close still releases resources; its retained WAL is the
-recovery authority on the next Open. The destructor calls Close and cannot
-report its result, so callers that need error handling should call Close
-explicitly. If a Compaction state already exists, Close retries it, but it does
-not start a new Compaction.
-
-The V9 suite blocks table creation to prove next-generation Put/Get progress,
-recovers crashes with two consecutive WALs before and after old-Manifest
-publication, retries a background publication error, triggers automatic
-Compaction, verifies a failed Close remains recoverable, and races four readers,
-one serialized writer, and two Close calls.
-Run it directly with:
-
-```bash
-./build/minikv_concurrency_test
-```
-
-The V10 reliability target uses fixed seeds and prints them before execution.
-It checks a long `std::map` reference model across maintenance and restart,
-strict-write recovery after coordinated SIGKILL, bounded multi-reader and
-multi-writer pressure, and same-key Sequence ordering:
-
-```bash
-./build/minikv_reliability_test
-```
-
-The format-fuzz target checks the stable status-code contract, current golden
-formats, explicit rejection of unsupported formats, arbitrary byte strings,
-mutated valid corpora, and mutated SSTable files. It is deterministic rather
-than coverage-guided, so every CI failure is directly reproducible:
-
-```bash
-./build/minikv_format_fuzz_test
-```
-
-## Reproducible benchmark
-
-Build benchmarks in Release mode and run either one workload or the fixed
-matrix. Every workload uses a deterministic default seed, verifies its final
-logical values unless disabled, owns one scratch database, and removes that
-database when it finishes:
-
-```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release --parallel
-
-./build-release/minikv_benchmark \
-  --workload read-miss --operations 5000 --keys 5000 --bloom on
-
-./bench/run_matrix.sh ./build-release/minikv_benchmark \
-  benchmark-results/matrix > benchmark-results/matrix.jsonl
-```
-
-The matrix covers sequential/random asynchronous writes, hit/miss reads,
-Bloom on/off, compacted/uncompacted reads, 50/50 and 95/5 read/write mixes,
-four-reader traffic, and a smaller strict-sync write run. Each result is one
-JSON object so repeated runs can be retained and compared without parsing
-human-oriented text.
-
-The metric boundaries are explicit:
-
-- `ops_per_second` and P50/P95/P99 cover timed user operations;
-- `end_to_end_ops_per_second` also includes the final write Flush, reported
-  separately as `maintenance_us`;
-- data blocks, tables, and bytes per read come from exact engine counters;
-- estimated write amplification is `(encoded WAL bytes + SSTable bytes) /
-  logical key/value bytes` for pure-write workloads only. It deliberately
-  excludes MANIFEST rewrites, filesystem metadata, and device-level writes;
-- space amplification is current SSTable, WAL, and MANIFEST bytes divided by
-  current logical key/value bytes.
-
-One Release run in the project virtual machine produced these illustrative
-results. They characterize this run, not other hardware and not RocksDB:
-
-| Workload/configuration | End-to-end ops/s | P50 us | Data blocks/read |
-| --- | ---: | ---: | ---: |
-| Sequential write, async | 66,193 | 2.900 | 0 |
-| Sequential write, strict | 2,406 | 368.502 | 0 |
-| Read hit, Bloom on, 16 L0 tables | 10,385 | 80.570 | 1.155 |
-| Read miss, Bloom on, 16 L0 tables | 66,838 | 1.615 | 0.156 |
-| Read miss, Bloom off, 16 L0 tables | 811 | 1,202.891 | 15.788 |
-| Read miss, Bloom on, compacted | 859,096 | 0.220 | 0.011 |
-| Parallel read hit, four threads | 36,364 | 78.404 | 1.156 |
-
-The measured optimization cycle targeted Bloom hashing. The two seeded FNV
-passes now traverse each key together and retain the exact old unsigned hash
-operations, finalization, and double-hash positions. Golden-format and Bloom
-tests retain the same 986/100,000 false positives, and the fixed 32-table miss
-fixture retained exactly 0.326 blocks and 1,311.253 bytes per read. Five
-100,000-operation before/after runs had median throughput of 31,879 and 31,893
-ops/s respectively, a 0.05% difference that is inside machine noise. The
-change removes duplicate key traversal, but V11 intentionally makes no
-end-to-end speedup claim from that result. Linux `perf` counters were
-unavailable in this virtual machine because `perf_event_paranoid` is 4; the
-project does not change host security policy to manufacture a profile.
-
-## Build and test
-
-Requirements:
+MiniKV is a small embedded key-value storage engine for Linux, written in
+C++17. It is an educational LSM-style engine with durable writes, recovery,
+SSTables, Bloom filters, compaction, range scans, background maintenance, and
+reproducible tests and benchmarks.
+
+Current package version: **1.0.0**.
+
+## Highlights
+
+- binary-safe `Put`, `Get`, and `Delete`;
+- strict or asynchronous WAL durability;
+- crash recovery and checked on-disk formats;
+- indexed SSTables, Bloom filters, and L0-to-L1 compaction;
+- range and prefix scans with continuation tokens;
+- single-writer/multi-reader access and optional background maintenance;
+- CMake installation and the exported `minikv::minikv` target.
+
+For storage formats, invariants, recovery boundaries, concurrency semantics,
+benchmark methodology, and the V0–V11 roadmap, see
+[Development Details](DEVELOPMENT_DETAILS.md).
+
+## Requirements
 
 - Linux
 - CMake 3.16 or newer
 - a C++17 compiler such as GCC 9 or newer
 
+## Build and test
+
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Run the memory-safety configurations separately:
+The normal test suite includes a package-install smoke test. ASan and UBSan
+can be enabled with `MINIKV_ENABLE_ASAN` and `MINIKV_ENABLE_UBSAN` in separate
+build directories.
+
+## Install
+
+Install into a local prefix without changing the host system:
 
 ```bash
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMINIKV_ENABLE_ASAN=ON
-cmake --build build-asan --parallel
-ctest --test-dir build-asan --output-on-failure
-
-cmake -S . -B build-ubsan -DCMAKE_BUILD_TYPE=Debug -DMINIKV_ENABLE_UBSAN=ON
-cmake --build build-ubsan --parallel
-ctest --test-dir build-ubsan --output-on-failure
+cmake --install build --prefix "$PWD/minikv-prefix"
 ```
 
-ThreadSanitizer is configured and must use its own build directory. Some
-virtualized Linux environments cannot initialize its shadow-memory mapping;
-that platform failure must not be reported as a passing race check.
+The prefix contains:
 
-Inspect an SSTable without loading it into the database:
+```text
+bin/minikv_benchmark
+bin/minikv_sstable_dump
+include/minikv/*.hpp
+lib/libminikv.a
+lib/cmake/MiniKV/
+```
+
+Generate a TGZ package with:
 
 ```bash
-./build/minikv_sstable_dump /path/to/00000000000000000001.sst 20
+cpack --config build/CPackConfig.cmake -G TGZ
 ```
 
-Keys and values are printed as hexadecimal so arbitrary binary data remains
-unambiguous.
+## Use from another CMake project
 
-## Install and consume
-
-Install the Release build into an isolated prefix, or generate a relocatable
-TGZ containing the same headers, static library, tools, and CMake package
-metadata:
+Configure the consumer with the MiniKV installation prefix:
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release --parallel
-cmake --install build-release --prefix "$PWD/minikv-prefix"
-
-cpack --config build-release/CPackConfig.cmake -G TGZ
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=/absolute/path/to/minikv-prefix
+cmake --build build --parallel
 ```
 
-An unrelated CMake project consumes only the installed package:
+Consumer `CMakeLists.txt`:
 
 ```cmake
 cmake_minimum_required(VERSION 3.16)
-project(my_embedded_store LANGUAGES CXX)
+project(my_store LANGUAGES CXX)
 
 find_package(MiniKV 1.0 CONFIG REQUIRED)
 
@@ -687,99 +88,63 @@ target_link_libraries(my_store PRIVATE minikv::minikv)
 target_compile_features(my_store PRIVATE cxx_std_17)
 ```
 
-Configure that consumer with the absolute install prefix:
+Minimal `main.cpp`:
+
+```cpp
+#include <iostream>
+#include <memory>
+
+#include "minikv/database.hpp"
+
+int main() {
+    minikv::Options options;
+    std::unique_ptr<minikv::Database> database;
+    minikv::DatabaseOpenResult open_result;
+
+    auto status = minikv::Database::Open(
+        "./example-data",
+        options,
+        &database,
+        &open_result
+    );
+    if (!status.ok()) {
+        std::cerr << status.ToString() << '\n';
+        return 1;
+    }
+
+    status = database->Put("hello", "MiniKV");
+    const auto result = database->Get("hello");
+    if (!status.ok() || !result.status.ok()) {
+        return 2;
+    }
+
+    std::cout << result.value << '\n';
+    return database->Close().ok() ? 0 : 3;
+}
+```
+
+Strict WAL synchronization is the default. Applications that explicitly
+accept possible loss of recently acknowledged writes after a crash may select
+asynchronous writes through `WriteOptions`.
+
+## Included tools
+
+Run the fixed benchmark matrix:
 
 ```bash
-cmake -S /path/to/my_store -B /path/to/my_store/build \
-  -DCMAKE_PREFIX_PATH=/absolute/path/to/minikv-prefix
-cmake --build /path/to/my_store/build --parallel
+./bench/run_matrix.sh ./build/minikv_benchmark \
+  benchmark-results/matrix > benchmark-results/matrix.jsonl
 ```
 
-Normal non-sanitized `ctest` includes `install_smoke`. It installs MiniKV into
-a clean prefix, configures a separate consumer through `find_package`, links
-against `minikv::minikv`, performs Put/Get, closes, reopens, and verifies the
-persisted value. The consumer receives no source-tree include or library path.
+Inspect an SSTable without opening the database:
 
-`MiniKV 1.0.0` is the semantic engine/package version. WAL, MANIFEST, SSTable,
-Bloom, continuation-token, and directory-storage versions are independent
-compatibility contracts and do not change merely because the package version
-changes.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    W[Put / Delete] --> Q[Sequence number]
-    Q --> L[Write-ahead log]
-    L --> M[Mutable MemTable]
-    M --> I[Immutable MemTable]
-    I --> F[Background Flush worker]
-    F --> S[Indexed L0 SSTable]
-    S --> V[Atomic MANIFEST / Version]
-    V --> C[Manual or triggered L0 to L1 Compaction]
-
-    N[Next generation WAL] --> M
-
-    R[Get] --> M
-    R --> I
-    R --> S
-    X[Range / Prefix Scan] --> M
-    X --> I
-    X --> S
+```bash
+./build/minikv_sstable_dump /path/to/table.sst 20
 ```
-
-The roadmap is incremental:
-
-1. V0: memory semantics, sequence numbers, tombstones, and model tests.
-2. V1: versioned WAL encoding, complete writes, checksums, and sync policy.
-3. V2: WAL replay, tail repair, corruption detection, and crash tests.
-4. V3: MemTable generations, per-generation WALs, and safe foreground Flush.
-5. V4: block-oriented SSTables, sparse indexes, checksums, and disk point lookup.
-6. V5: MANIFEST, atomic Version publication, storage identity, and directory
-   locking.
-7. V6: Bloom filters and read-path statistics (complete).
-8. V7: semantics-preserving L0-to-L1 Compaction (complete).
-9. V8: bounded deterministic range/prefix scans and continuation tokens
-   (complete).
-10. V9: background Flush/Compaction, single-writer/multi-reader coordination,
-    stable scan views, and idempotent shutdown (complete).
-11. V10: model, fault, crash, format-compatibility, fuzz, and concurrency stress
-    testing with stable error categories (complete).
-12. V11: reproducible workloads, latency percentiles, amplification metrics,
-    one measured optimization cycle, and installable package/API stabilization.
-
-## Core invariants
-
-- Every accepted record has a non-zero sequence number.
-- The greatest sequence number wins for the same user key.
-- Tombstones remain visible internally until they are safe to discard.
-- Storage errors and corruption are never converted into NotFound.
-- Every disk-derived offset and length is validated before it is used.
-- A generation WAL is removed only after a valid, durable table is referenced
-  by a durable MANIFEST.
-- Every MANIFEST reference must name an existing, validated file with matching
-  immutable metadata.
-- Files absent from the current Version never participate in reads.
-- At most one process owns a database directory's exclusive `LOCK`.
-- A background Flush publishes only its Immutable generation's Sequence
-  frontier; newer WAL records are never claimed by an older MANIFEST.
-- Closing rejects new work, joins the worker, and leaves every unflushed
-  committed record recoverable from a retained WAL.
 
 ## Scope
 
-MiniKV is a single-node embedded engine. The initial scope excludes SQL,
-network protocols, distributed consensus, replication, transactions, MVCC,
-compression, encryption, and RocksDB file compatibility. Benchmark results
-will characterize MiniKV itself, not claim a production-grade comparison.
-
-## Repository layout
-
-```text
-.
-├── CMakeLists.txt
-├── include/minikv/
-├── src/
-├── tests/
-└── tools/
-```
+MiniKV is a single-node embedded engine. It does not provide SQL, networking,
+replication, distributed consensus, MVCC, or multi-key transactions. It is a
+learning-oriented storage engine rather than a production replacement for
+RocksDB.
