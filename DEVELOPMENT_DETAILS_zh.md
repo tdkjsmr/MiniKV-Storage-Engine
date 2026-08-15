@@ -525,6 +525,24 @@ cmake --install build-release --prefix "$PWD/minikv-prefix"
 cpack --config build-release/CPackConfig.cmake -G TGZ
 ```
 
+`vMAJOR.MINOR.PATCH` 格式的 Tag 会触发专用 Release workflow。Workflow 固定
+使用 Ubuntu 22.04 和 x86-64 runner，验证 Tag 与 CMake 项目版本一致，运行完整
+测试，生成 TGZ，再使用解压后的安装包构建并运行外部 consumer。以上步骤全部
+通过后，才会将安装包与 `SHA256SUMS` 发布至 GitHub Releases。
+
+无需克隆仓库即可下载 v1.0.0 binary SDK：
+
+```bash
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/minikv-1.0.0-linux-x86_64.tar.gz
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/SHA256SUMS
+sha256sum --check SHA256SUMS
+tar -xzf minikv-1.0.0-linux-x86_64.tar.gz
+```
+
+该 SDK 提供 C++ 静态库，并不是无需开发环境的通用独立应用。Consumer 仍需
+C++17 compiler 和 CMake；预编译 object 与工具需要兼容 Ubuntu 22.04 构建
+基线的 Linux、glibc 和 libstdc++ 环境。
+
 外部 CMake 项目只使用安装产物：
 
 ```cmake
@@ -542,7 +560,8 @@ cmake --build /path/to/my_store/build --parallel
 
 非 sanitizer 的普通 `ctest` 包含 `install_smoke`：它安装 MiniKV 到干净 prefix，
 通过 `find_package` 配置独立 consumer，链接 `minikv::minikv`，完成 Put/Get、
-Close、reopen 和持久值验证。Consumer 不接收源码树 include/library path。
+Close、reopen 和持久值验证。Release 专用的 `package_smoke.cmake` 对解压后的
+TGZ 重复这一契约。两个 consumer 都不接收源码树 include/library path。
 
 MiniKV 1.0.0 是软件包语义版本。WAL、MANIFEST、SSTable、Bloom、continuation
 token 和 directory-storage version 是互相独立的兼容性契约。

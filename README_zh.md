@@ -28,7 +28,29 @@ SSTable、Bloom Filter、Compaction、范围扫描、后台维护以及可复现
 - CMake 3.16 或更高版本
 - 支持 C++17 的编译器，例如 GCC 9 或更高版本
 
-## 构建与测试
+## 下载预编译安装包
+
+GitHub Release 提供 Linux x86-64 SDK，无需克隆本仓库即可使用：
+
+```bash
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/minikv-1.0.0-linux-x86_64.tar.gz
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/SHA256SUMS
+sha256sum --check SHA256SUMS
+tar -xzf minikv-1.0.0-linux-x86_64.tar.gz
+```
+
+将解压目录作为 CMake prefix：
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=/absolute/path/to/minikv-1.0.0-linux-x86_64
+```
+
+该安装包在 Ubuntu 22.04 构建，包含 C++ 静态库、头文件、工具和 CMake
+metadata。Consumer 仍需要 C++17 toolchain，以及兼容的 Linux、glibc 和
+libstdc++ runtime。
+
+## 从源码构建与测试
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -39,7 +61,7 @@ ctest --test-dir build --output-on-failure
 普通测试套件包含安装包冒烟测试。ASan 和 UBSan 可分别在独立构建目录中
 通过 `MINIKV_ENABLE_ASAN` 和 `MINIKV_ENABLE_UBSAN` 开启。
 
-## 安装
+## 从源码安装
 
 安装到本地前缀，不修改主机的系统目录：
 
