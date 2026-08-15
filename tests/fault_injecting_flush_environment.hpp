@@ -17,6 +17,7 @@ enum class FlushFailurePoint {
     kRename,
     kDirectorySync,
     kRemoveWal,
+    kRemoveCompactionInput,
     kManifestCreate,
     kManifestWrite,
     kManifestFileSync,
@@ -68,7 +69,10 @@ private:
     };
 
 public:
-    void Arm(FlushFailurePoint failure) { active_failure_ = failure; }
+    void Arm(FlushFailurePoint failure) {
+        active_failure_ = failure;
+        manifest_renamed_ = false;
+    }
     void Disarm() { active_failure_ = FlushFailurePoint::kNone; }
 
     Status CreateTruncated(
@@ -111,6 +115,10 @@ public:
         if (active_failure_ == FlushFailurePoint::kRemoveWal &&
             path.size() >= 4 && path.substr(path.size() - 4) == ".wal") {
             return Status::IOError("injected WAL removal");
+        }
+        if (active_failure_ == FlushFailurePoint::kRemoveCompactionInput &&
+            path.size() >= 4 && path.substr(path.size() - 4) == ".sst") {
+            return Status::IOError("injected compaction input removal");
         }
         return delegate_.RemoveFile(path);
     }

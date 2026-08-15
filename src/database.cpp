@@ -1,11 +1,13 @@
 #include "minikv/database.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -114,6 +116,24 @@ Database::ImmutableGeneration::ImmutableGeneration(
       wal_path(std::move(immutable_wal_path)),
       memtable(std::move(immutable_memtable)) {}
 
+struct Database::CompactionState {
+    std::set<std::uint64_t> input_file_numbers;
+    std::vector<std::string> cleanup_paths;
+    std::vector<MemTable> output_memtables;
+    std::vector<std::unique_ptr<SSTableReader>> published_outputs;
+    CompactionBuildStats build_stats;
+    Version candidate;
+    CompactionStats stats;
+    std::chrono::steady_clock::time_point started =
+        std::chrono::steady_clock::now();
+    std::uint64_t first_output_file_number = 0;
+    std::size_t cleanup_index = 0;
+    bool candidate_ready = false;
+    bool version_published = false;
+    bool cleanup_synced = false;
+    bool wal_generation_advanced = false;
+};
+
 Status Database::Open(
     std::string directory,
     Options options,
@@ -143,6 +163,7 @@ Status Database::OpenWithEnvironment(
     *open_result = {};
     if (directory.empty() || environment == nullptr ||
         options.memtable_size_limit == 0 ||
+        options.compaction_output_size_limit == 0 ||
         options.max_key_size == 0 ||
         options.max_key_size > std::numeric_limits<std::uint32_t>::max() ||
         options.max_value_size > std::numeric_limits<std::uint32_t>::max() ||
@@ -497,6 +518,12 @@ Status Database::Write(
         write_options.sync_mode != SyncMode::kAsync) {
         return Status::InvalidArgument("write sync mode is invalid");
     }
+    if (compaction_ != nullptr) {
+        const auto compaction_status = ContinueCompaction(nullptr);
+        if (!compaction_status.ok()) {
+            return compaction_status;
+        }
+    }
     if (immutable_ != nullptr) {
         const auto flush_status = ContinueFlush();
         if (!flush_status.ok()) {
@@ -544,6 +571,12 @@ Status Database::Flush() {
     if (!status_.ok()) {
         return status_;
     }
+    if (compaction_ != nullptr) {
+        const auto compaction_status = ContinueCompaction(nullptr);
+        if (!compaction_status.ok()) {
+            return compaction_status;
+        }
+    }
     if (immutable_ == nullptr) {
         if (mutable_.empty()) {
             return Status::Ok();
@@ -554,6 +587,256 @@ Status Database::Flush() {
         }
     }
     return ContinueFlush();
+}
+
+Status Database::Compact(CompactionStats* stats) {
+    if (stats != nullptr) {
+        *stats = {};
+    }
+    if (!status_.ok()) {
+        return status_;
+    }
+    if (compaction_ != nullptr) {
+        return ContinueCompaction(stats);
+    }
+    if (immutable_ != nullptr || !mutable_.empty()) {
+        const auto flush_status = Flush();
+        if (!flush_status.ok()) {
+            return flush_status;
+        }
+    }
+    if (immutable_ != nullptr || !mutable_.empty() || wal_ == nullptr) {
+        return DatabaseCorruption(
+            "compaction requires an empty active WAL generation"
+        );
+    }
+    const auto prepare_status = PrepareCompaction();
+    if (!prepare_status.ok() || compaction_ == nullptr) {
+        return prepare_status;
+    }
+    return ContinueCompaction(stats);
+}
+
+Status Database::PrepareCompaction() {
+    if (compaction_ != nullptr || tables_.size() != version_.tables().size()) {
+        return DatabaseCorruption("table readers and Version disagree");
+    }
+
+    bool have_level_zero = false;
+    std::string minimum_key;
+    std::string maximum_key;
+    for (const auto& table : version_.tables()) {
+        if (table.level == 0) {
+            if (!have_level_zero) {
+                minimum_key = table.metadata.minimum_key;
+                maximum_key = table.metadata.maximum_key;
+                have_level_zero = true;
+            } else {
+                minimum_key = std::min(minimum_key, table.metadata.minimum_key);
+                maximum_key = std::max(maximum_key, table.metadata.maximum_key);
+            }
+        }
+    }
+    if (!have_level_zero) {
+        last_compaction_statistics_ = {};
+        return Status::Ok();
+    }
+
+    auto state = std::make_unique<CompactionState>();
+    state->first_output_file_number = version_.next_file_number();
+    std::vector<CompactionInput> inputs;
+    for (std::size_t index = 0; index < version_.tables().size(); ++index) {
+        const auto& version_table = version_.tables()[index];
+        const auto& reader = tables_[index];
+        if (reader == nullptr ||
+            reader->metadata().generation != version_table.metadata.generation) {
+            return DatabaseCorruption("table reader order is inconsistent");
+        }
+        const bool overlaps =
+            version_table.level == 1 &&
+            version_table.metadata.maximum_key >= minimum_key &&
+            version_table.metadata.minimum_key <= maximum_key;
+        if (version_table.level != 0 && !overlaps) {
+            continue;
+        }
+        inputs.push_back({version_table.level, reader.get()});
+        state->input_file_numbers.insert(version_table.metadata.generation);
+        state->cleanup_paths.push_back(reader->path());
+        if (state->stats.input_bytes >
+            std::numeric_limits<std::uint64_t>::max() -
+                version_table.metadata.file_size) {
+            return Status::InvalidArgument("compaction byte count overflows");
+        }
+        state->stats.input_bytes += version_table.metadata.file_size;
+    }
+    state->stats.input_files =
+        static_cast<std::uint64_t>(state->input_file_numbers.size());
+
+    const auto build_status = BuildCompactionOutputs(
+        inputs,
+        options_,
+        true,
+        &state->output_memtables,
+        &state->build_stats
+    );
+    if (!build_status.ok()) {
+        return build_status;
+    }
+    if (state->output_memtables.size() >
+        std::numeric_limits<std::uint64_t>::max() -
+            state->first_output_file_number) {
+        return Status::InvalidArgument("compaction file numbers overflow");
+    }
+    state->stats.input_records = state->build_stats.input_records;
+    state->stats.output_records = state->build_stats.output_records;
+    state->stats.duplicate_records_dropped =
+        state->build_stats.duplicate_records_dropped;
+    state->stats.tombstones_dropped = state->build_stats.tombstones_dropped;
+    compaction_ = std::move(state);
+    return Status::Ok();
+}
+
+Status Database::ContinueCompaction(CompactionStats* stats) {
+    if (compaction_ == nullptr) {
+        return Status::Ok();
+    }
+    auto& state = *compaction_;
+
+    if (!state.output_memtables.empty() && state.published_outputs.empty()) {
+        const auto publish_status = PublishCompactionTables(
+            directory_,
+            state.first_output_file_number,
+            state.output_memtables,
+            options_,
+            *environment_,
+            &state.published_outputs
+        );
+        if (!publish_status.ok()) {
+            return publish_status;
+        }
+    }
+
+    if (!state.candidate_ready) {
+        VersionEdit edit;
+        edit.deleted_file_numbers.assign(
+            state.input_file_numbers.begin(),
+            state.input_file_numbers.end()
+        );
+        for (const auto& output : state.published_outputs) {
+            VersionTable added;
+            added.level = 1;
+            added.metadata = output->metadata();
+            edit.added_tables.push_back(std::move(added));
+            if (state.stats.output_bytes >
+                std::numeric_limits<std::uint64_t>::max() -
+                    output->metadata().file_size) {
+                return Status::InvalidArgument("compaction byte count overflows");
+            }
+            state.stats.output_bytes += output->metadata().file_size;
+        }
+        state.stats.output_files =
+            static_cast<std::uint64_t>(state.published_outputs.size());
+        if (!state.published_outputs.empty()) {
+            edit.next_file_number =
+                state.first_output_file_number + state.stats.output_files;
+        }
+        const auto apply_status = version_.Apply(edit, options_, &state.candidate);
+        if (!apply_status.ok()) {
+            return apply_status;
+        }
+        state.candidate_ready = true;
+    }
+
+    if (!state.version_published) {
+        const auto manifest_status = PublishManifest(
+            directory_,
+            state.candidate,
+            options_,
+            *environment_
+        );
+        if (!manifest_status.ok()) {
+            return manifest_status;
+        }
+
+        std::vector<std::unique_ptr<SSTableReader>> live_tables;
+        live_tables.reserve(
+            tables_.size() - state.input_file_numbers.size() +
+            state.published_outputs.size()
+        );
+        for (auto& table : tables_) {
+            if (state.input_file_numbers.find(table->metadata().generation) ==
+                state.input_file_numbers.end()) {
+                live_tables.push_back(std::move(table));
+            }
+        }
+        for (auto& table : state.published_outputs) {
+            live_tables.push_back(std::move(table));
+        }
+        std::sort(
+            live_tables.begin(),
+            live_tables.end(),
+            [](const auto& left, const auto& right) {
+                return left->metadata().generation < right->metadata().generation;
+            }
+        );
+        tables_ = std::move(live_tables);
+        version_ = state.candidate;
+        state.version_published = true;
+
+        if (!state.output_memtables.empty()) {
+            state.cleanup_paths.push_back(WalPath(mutable_generation_));
+            wal_.reset();
+            mutable_generation_ = version_.next_file_number();
+            state.wal_generation_advanced = true;
+        }
+    }
+
+    while (state.cleanup_index < state.cleanup_paths.size()) {
+        const auto remove_status = environment_->RemoveFile(
+            state.cleanup_paths[state.cleanup_index]
+        );
+        if (!remove_status.ok()) {
+            return remove_status;
+        }
+        ++state.cleanup_index;
+    }
+    if (!state.cleanup_synced) {
+        const auto sync_status = environment_->SyncDirectory(directory_);
+        if (!sync_status.ok()) {
+            return sync_status;
+        }
+        state.cleanup_synced = true;
+    }
+    if (state.wal_generation_advanced) {
+        const auto wal_status = OpenMutableWal();
+        if (!wal_status.ok()) {
+            return wal_status;
+        }
+    }
+
+    state.stats.bytes_reclaimed = state.stats.input_bytes > state.stats.output_bytes
+        ? state.stats.input_bytes - state.stats.output_bytes
+        : 0;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - state.started
+    ).count();
+    state.stats.elapsed_microseconds = elapsed > 0
+        ? static_cast<std::uint64_t>(elapsed)
+        : 0;
+    last_compaction_statistics_ = state.stats;
+    if (stats != nullptr) {
+        *stats = state.stats;
+    }
+    compaction_.reset();
+    return Status::Ok();
+}
+
+std::size_t Database::level_table_count(std::uint32_t level) const noexcept {
+    return static_cast<std::size_t>(std::count_if(
+        version_.tables().begin(),
+        version_.tables().end(),
+        [level](const VersionTable& table) { return table.level == level; }
+    ));
 }
 
 Status Database::FreezeMutable() {

@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "minikv/compaction.hpp"
 #include "minikv/flush.hpp"
 #include "minikv/manifest.hpp"
 #include "minikv/memtable.hpp"
@@ -41,6 +42,19 @@ struct DatabaseReadStats {
     std::uint64_t bloom_false_positives = 0;
     std::uint64_t data_blocks_read = 0;
     std::uint64_t bytes_read = 0;
+};
+
+struct CompactionStats {
+    std::uint64_t input_files = 0;
+    std::uint64_t output_files = 0;
+    std::uint64_t input_records = 0;
+    std::uint64_t output_records = 0;
+    std::uint64_t duplicate_records_dropped = 0;
+    std::uint64_t tombstones_dropped = 0;
+    std::uint64_t input_bytes = 0;
+    std::uint64_t output_bytes = 0;
+    std::uint64_t bytes_reclaimed = 0;
+    std::uint64_t elapsed_microseconds = 0;
 };
 
 class Database {
@@ -79,6 +93,10 @@ public:
     // its WAL remain available and Flush can be retried.
     Status Flush();
 
+    // V7 runs a foreground L0-to-L1 compaction. All L0 inputs and the
+    // overlapping L1 range are committed through one VersionEdit.
+    Status Compact(CompactionStats* stats = nullptr);
+
     [[nodiscard]] std::uint64_t last_sequence() const noexcept {
         return last_sequence_;
     }
@@ -94,15 +112,24 @@ public:
     [[nodiscard]] std::size_t flushed_table_count() const noexcept {
         return tables_.size();
     }
+    [[nodiscard]] std::size_t level_table_count(
+        std::uint32_t level
+    ) const noexcept;
     [[nodiscard]] std::uint64_t version_id() const noexcept {
         return version_.id();
     }
     [[nodiscard]] DatabaseReadStats read_statistics() const noexcept {
         return read_statistics_;
     }
+    [[nodiscard]] const CompactionStats& last_compaction_statistics()
+        const noexcept {
+        return last_compaction_statistics_;
+    }
     [[nodiscard]] const Status& status() const noexcept { return status_; }
 
 private:
+    struct CompactionState;
+
     struct ImmutableGeneration {
         ImmutableGeneration(
             std::uint64_t generation,
@@ -139,6 +166,8 @@ private:
     );
     Status FreezeMutable();
     Status ContinueFlush();
+    Status PrepareCompaction();
+    Status ContinueCompaction(CompactionStats* stats);
     Status OpenMutableWal();
     [[nodiscard]] std::string WalPath(std::uint64_t generation) const;
     [[nodiscard]] static LookupResult UserVisible(LookupResult result);
@@ -157,9 +186,11 @@ private:
     std::uint64_t mutable_generation_ = 0;
     std::unique_ptr<WalWriter> wal_;
     std::unique_ptr<ImmutableGeneration> immutable_;
+    std::unique_ptr<CompactionState> compaction_;
     std::vector<std::unique_ptr<SSTableReader>> tables_;
     std::uint64_t last_sequence_ = 0;
     mutable DatabaseReadStats read_statistics_;
+    CompactionStats last_compaction_statistics_;
     Status status_;
 };
 

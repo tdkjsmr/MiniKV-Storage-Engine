@@ -7,8 +7,8 @@ reproducible correctness tests.
 
 ## Current status
 
-V6 adds checksummed Bloom filters and observable point-read statistics on top
-of the V5 authoritative Version and indexed SSTable read path:
+V7 adds foreground L0-to-L1 compaction on top of the V6 Bloom-filtered,
+indexed SSTable read path and authoritative Version model:
 
 - binary-safe keys and values with configurable size limits;
 - monotonically increasing sequence numbers and last-write-wins semantics;
@@ -52,16 +52,29 @@ of the V5 authoritative Version and indexed SSTable read path:
 - key-range rejection without a data-block read;
 - reads across Mutable, Immutable, and multiple SSTables, with the greatest
   sequence number winning and tombstones converted to user-visible NotFound;
+- manual foreground compaction of every L0 file plus all L1 files overlapping
+  the selected key-range union;
+- minimum-heap multiway merge with greatest-sequence-wins duplicate collapse;
+- safe tombstone removal after selecting the complete bottommost range, with
+  deletion-only compactions allowed to produce no SSTable;
+- key-sorted L1 outputs split at a configurable approximate data-size target,
+  with validated non-overlapping L1 ranges;
+- one atomic `VersionEdit` that adds every compaction output and deletes every
+  input, followed by input-file removal only after old readers are released;
+- per-compaction input/output file, record, byte, duplicate, tombstone,
+  elapsed-time, and reclaimed-byte statistics;
 - a read-only `minikv_sstable_dump` diagnostic utility;
 - deterministic random-model tests, exhaustive one-byte SSTable and MANIFEST
-  corruption, per-stage publication failures, lock-conflict tests, restart
-  tests, and sanitizer build options.
+  corruption, per-stage Flush and Compaction publication failures, real
+  SIGKILL commit-boundary tests, lock-conflict tests, restart tests, and
+  sanitizer build options.
 
-V6 still uses foreground Flush. It does not yet have Compaction, range scans,
-background work, in-process concurrent calls, compression, or an automatic
-storage-format upgrade path. Read counters are not yet concurrency-safe.
-Unsupported directory formats are rejected; migration must be an explicit
-offline operation.
+V7 still uses foreground Flush and manual foreground Compaction. It supports
+only L0 and non-overlapping L1, not a general multi-level compaction policy. It
+does not yet have range scans, background work, in-process concurrent calls,
+compression, or an automatic storage-format upgrade path. Statistics are not
+yet concurrency-safe. Unsupported directory formats are rejected; migration
+must be an explicit offline operation.
 
 ## WAL format version 1
 
@@ -191,7 +204,7 @@ The fixed Header is:
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 4 | Magic `MKST` |
-| 4 | 1 | Format version `2` |
+| 4 | 1 | Format version `3` |
 | 5 | 1 | Reserved |
 | 6 | 2 | Header size |
 | 8 | 8 | Generation |
@@ -279,6 +292,60 @@ machine load, and build mode affect them. Reproduce both experiments with:
 ./build/minikv_bloom_filter_test
 ```
 
+## L0-to-L1 compaction
+
+`Database::Compact` first flushes pending mutable data, then selects all L0
+tables. Their minimum-to-maximum key union determines which L1 tables overlap;
+endpoint equality counts as overlap. Selecting the complete overlapping range
+is what makes it safe in this two-level engine to remove a winning tombstone:
+there is no unselected older value for that key below L1. A future engine with
+deeper levels would have to retain the tombstone unless it proved those levels
+also contain no older value.
+
+Each input is already key-sorted. A minimum heap merges the current record from
+every input, and the greatest Sequence wins for equal user keys. Output is
+split using `Options::compaction_output_size_limit`, which defaults to 2 MiB of
+approximate record data. L1 ranges are validated as strictly non-overlapping.
+
+Publication uses this order:
+
+```text
+encode every output
+    -> write and fdatasync every .sst.tmp
+    -> rename every output SSTable
+    -> fsync database directory
+    -> reopen and validate every output
+    -> build one VersionEdit: add outputs + delete inputs
+    -> write, fdatasync, rename, and directory-sync MANIFEST
+    -> publish the new in-memory Version
+    -> release old input readers
+    -> remove input SSTables and obsolete empty WAL
+    -> fsync database directory
+```
+
+Before MANIFEST publication, the old Version remains authoritative and output
+files are harmless orphans. After publication, the new Version is authoritative
+and old inputs are harmless orphans. Startup removes whichever set is not
+referenced. Every step is retryable in process.
+
+```cpp
+minikv::CompactionStats stats;
+const minikv::Status status = database->Compact(&stats);
+if (status.ok()) {
+    // stats.input_bytes, stats.output_bytes, stats.bytes_reclaimed, ...
+}
+```
+
+The V7 suite covers duplicate keys across generations, Put-Delete-Put,
+Put-Delete, all-tombstone output, disjoint and equal-boundary ranges, output
+splitting, a deterministic reference model before/after/restart, 12 injected
+publication/cleanup failures, and six real SIGKILL commit boundaries. Run it
+directly with:
+
+```bash
+./build/minikv_compaction_test
+```
+
 ## Build and test
 
 Requirements:
@@ -317,7 +384,7 @@ Inspect an SSTable without loading it into the database:
 Keys and values are printed as hexadecimal so arbitrary binary data remains
 unambiguous.
 
-## Planned architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -345,7 +412,7 @@ The roadmap is incremental:
 6. V5: MANIFEST, atomic Version publication, storage identity, and directory
    locking.
 7. V6: Bloom filters and read-path statistics (complete).
-8. V7: semantics-preserving L0-to-L1 Compaction.
+8. V7: semantics-preserving L0-to-L1 Compaction (complete).
 9. V8: bounded deterministic range/prefix scans and continuation tokens.
 10. V9: background Flush/Compaction, single-writer/multi-reader coordination,
     stable scan views, and idempotent shutdown.

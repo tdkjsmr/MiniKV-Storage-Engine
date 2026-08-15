@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.6.0
+    VERSION 0.7.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
@@ -51,6 +51,7 @@ add_library(
     minikv
     src/bloom_filter.cpp
     src/coding.cpp
+    src/compaction.cpp
     src/database_lock.cpp
     src/database.cpp
     src/file.cpp
@@ -125,4 +126,9 @@ if(MINIKV_BUILD_TESTS)
     target_link_libraries(minikv_bloom_filter_test PRIVATE minikv::minikv)
     minikv_set_target_options(minikv_bloom_filter_test)
     add_test(NAME bloom_filter COMMAND minikv_bloom_filter_test)
+
+    add_executable(minikv_compaction_test tests/compaction_test.cpp)
+    target_link_libraries(minikv_compaction_test PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_compaction_test)
+    add_test(NAME compaction COMMAND minikv_compaction_test)
 endif()

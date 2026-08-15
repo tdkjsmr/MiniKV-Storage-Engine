@@ -49,10 +49,11 @@ Status ValidateVersion(const Version& version, const Options& options) {
     }
 
     std::set<std::uint64_t> file_numbers;
+    std::vector<const VersionTable*> level_one_tables;
     std::uint64_t maximum_sequence = 0;
     for (const auto& table : version.tables()) {
         const auto& metadata = table.metadata;
-        if (table.level > 63 || metadata.generation == 0 ||
+        if (table.level > 1 || metadata.generation == 0 ||
             metadata.generation >= version.next_file_number() ||
             metadata.file_size == 0 || metadata.record_count == 0 ||
             metadata.minimum_sequence == 0 ||
@@ -63,7 +64,23 @@ Status ValidateVersion(const Version& version, const Options& options) {
             !file_numbers.insert(metadata.generation).second) {
             return ManifestCorruption("table metadata is invalid");
         }
+        if (table.level == 1) {
+            level_one_tables.push_back(&table);
+        }
         maximum_sequence = std::max(maximum_sequence, metadata.maximum_sequence);
+    }
+    std::sort(
+        level_one_tables.begin(),
+        level_one_tables.end(),
+        [](const VersionTable* left, const VersionTable* right) {
+            return left->metadata.minimum_key < right->metadata.minimum_key;
+        }
+    );
+    for (std::size_t index = 1; index < level_one_tables.size(); ++index) {
+        if (level_one_tables[index - 1]->metadata.maximum_key >=
+            level_one_tables[index]->metadata.minimum_key) {
+            return ManifestCorruption("level-one table ranges overlap");
+        }
     }
     if (version.last_sequence() < maximum_sequence) {
         return ManifestCorruption("sequence frontier precedes a live table");

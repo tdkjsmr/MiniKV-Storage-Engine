@@ -167,6 +167,34 @@ void TestManifestCorruptionAndVersionRejection() {
             minikv::StatusCode::kVersionMismatch,
         "unsupported storage-format golden file must report VersionMismatch"
     );
+
+    const auto version = SampleVersion();
+    minikv::VersionEdit unsupported_level;
+    auto level_two = SampleTable(2);
+    level_two.level = 2;
+    unsupported_level.added_tables.push_back(level_two);
+    unsupported_level.next_file_number = 3;
+    minikv::Version rejected;
+    minikv::test::Expect(
+        !version.Apply(unsupported_level, {}, &rejected).ok(),
+        "V7 must reject levels outside L0 and L1"
+    );
+
+    minikv::VersionEdit overlapping_level_one;
+    auto left = SampleTable(2);
+    left.level = 1;
+    left.metadata.maximum_key = "middle";
+    auto right = SampleTable(3);
+    right.level = 1;
+    right.metadata.minimum_key = "middle";
+    right.metadata.maximum_key = "zulu";
+    overlapping_level_one.added_tables.push_back(left);
+    overlapping_level_one.added_tables.push_back(right);
+    overlapping_level_one.next_file_number = 4;
+    minikv::test::Expect(
+        !version.Apply(overlapping_level_one, {}, &rejected).ok(),
+        "L1 ranges sharing a boundary key must be rejected as overlapping"
+    );
 }
 
 void TestManifestIsLiveSetAndOrphansAreRemoved() {
