@@ -2,18 +2,21 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     minikv
-    VERSION 0.10.0
+    VERSION 1.0.0
     DESCRIPTION "A small C++17 LSM-style key-value storage engine"
     LANGUAGES CXX
 )
 
 find_package(Threads REQUIRED)
+include(CMakePackageConfigHelpers)
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MINIKV_BUILD_TESTS "Build MiniKV tests" ON)
+option(MINIKV_BUILD_BENCHMARKS "Build MiniKV benchmark tools" ON)
 option(MINIKV_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(MINIKV_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(MINIKV_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
@@ -81,6 +84,55 @@ minikv_set_target_options(minikv)
 add_executable(minikv_sstable_dump tools/sstable_dump.cpp)
 target_link_libraries(minikv_sstable_dump PRIVATE minikv::minikv)
 minikv_set_target_options(minikv_sstable_dump)
+
+if(MINIKV_BUILD_BENCHMARKS)
+    add_executable(minikv_benchmark bench/benchmark.cpp)
+    target_link_libraries(minikv_benchmark PRIVATE minikv::minikv)
+    minikv_set_target_options(minikv_benchmark)
+endif()
+
+set(MINIKV_INSTALL_TARGETS minikv minikv_sstable_dump)
+if(TARGET minikv_benchmark)
+    list(APPEND MINIKV_INSTALL_TARGETS minikv_benchmark)
+endif()
+
+install(
+    TARGETS ${MINIKV_INSTALL_TARGETS}
+    EXPORT MiniKVTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(
+    DIRECTORY include/minikv
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.hpp"
+)
+
+set(MINIKV_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/MiniKV")
+configure_package_config_file(
+    cmake/MiniKVConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/MiniKVConfig.cmake"
+    INSTALL_DESTINATION "${MINIKV_CMAKE_INSTALL_DIR}"
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/MiniKVConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+install(
+    EXPORT MiniKVTargets
+    FILE MiniKVTargets.cmake
+    NAMESPACE minikv::
+    DESTINATION "${MINIKV_CMAKE_INSTALL_DIR}"
+)
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/MiniKVConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/MiniKVConfigVersion.cmake"
+    DESTINATION "${MINIKV_CMAKE_INSTALL_DIR}"
+)
 
 if(MINIKV_BUILD_TESTS)
     include(CTest)
@@ -156,5 +208,43 @@ if(MINIKV_BUILD_TESTS)
     minikv_set_target_options(minikv_format_fuzz_test)
     add_test(NAME format_fuzz COMMAND minikv_format_fuzz_test)
 
+    if(TARGET minikv_benchmark)
+        add_test(
+            NAME benchmark_smoke
+            COMMAND
+                minikv_benchmark
+                --workload read-miss
+                --operations 200
+                --keys 100
+                --value-size 64
+                --memtable-bytes 16384
+                --root "${PROJECT_BINARY_DIR}/benchmark-smoke"
+                --bloom on
+                --verify on
+        )
+        set_tests_properties(benchmark_smoke PROPERTIES TIMEOUT 30)
+    endif()
+
     set_tests_properties(reliability format_fuzz PROPERTIES TIMEOUT 180)
+
+    if(NOT MINIKV_ENABLE_ASAN AND NOT MINIKV_ENABLE_UBSAN AND
+       NOT MINIKV_ENABLE_TSAN)
+        add_test(
+            NAME install_smoke
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DMINIKV_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+                "-DMINIKV_BINARY_DIR=${PROJECT_BINARY_DIR}"
+                "-DMINIKV_INSTALL_CONFIG=${CMAKE_BUILD_TYPE}"
+                "-DMINIKV_GENERATOR=${CMAKE_GENERATOR}"
+                -P "${PROJECT_SOURCE_DIR}/tests/install_smoke.cmake"
+        )
+        set_tests_properties(install_smoke PROPERTIES TIMEOUT 120)
+    endif()
 endif()
+
+set(CPACK_PACKAGE_NAME "MiniKV")
+set(CPACK_PACKAGE_VENDOR "MiniKV")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_GENERATOR "TGZ")
+include(CPack)

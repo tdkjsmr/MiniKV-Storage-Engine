@@ -7,8 +7,9 @@ reproducible correctness tests.
 
 ## Current status
 
-V10 hardens the V9 background-maintenance engine with reproducible model,
-crash, format-fuzz, and bounded concurrency stress tests:
+V11 completes the planned engine with reproducible performance workloads,
+measured amplification, an installable CMake package, and the V10 model,
+crash, format-fuzz, and bounded concurrency stress coverage:
 
 - binary-safe keys and values with configurable size limits;
 - monotonically increasing sequence numbers and last-write-wins semantics;
@@ -94,12 +95,23 @@ crash, format-fuzz, and bounded concurrency stress tests:
   Sequence number;
 - 30,000 arbitrary decoder inputs, 12,000 mutations of valid format corpora,
   and 750 mutated SSTable files under fixed seeds;
+- a deterministic `minikv_benchmark` covering sequential and random writes,
+  hit and miss reads, 50/50 and 95/5 mixed traffic, and parallel reads;
+- throughput, end-to-end throughput, P50/P95/P99 latency, exact read
+  amplification, and clearly labelled estimated write and space amplification;
+- Bloom double hashes computed in one key pass while preserving every existing
+  hash value and serialized bit position;
+- semantic engine version `1.0.0` exposed separately from all on-disk format
+  versions;
+- standard `cmake --install` headers, static library, tools, exported
+  `minikv::minikv` target, versioned package config, TGZ packaging, and an
+  installed-consumer restart test;
 - exhaustive one-byte SSTable and MANIFEST corruption, per-stage Flush and
   Compaction publication failures, real commit-boundary SIGKILL tests,
   lock-conflict tests, restart tests, and sanitizer build options.
 
 Background maintenance is disabled by default so existing applications retain
-foreground timing until they opt in. V10 retains only one Immutable generation,
+foreground timing until they opt in. V11 retains only one Immutable generation,
 L0, and non-overlapping L1; it does not provide MVCC, multi-key
 transactions, lock-free maintenance, compression, or an automatic
 storage-format upgrade path. Unsupported directory formats are rejected;
@@ -548,6 +560,67 @@ than coverage-guided, so every CI failure is directly reproducible:
 ./build/minikv_format_fuzz_test
 ```
 
+## Reproducible benchmark
+
+Build benchmarks in Release mode and run either one workload or the fixed
+matrix. Every workload uses a deterministic default seed, verifies its final
+logical values unless disabled, owns one scratch database, and removes that
+database when it finishes:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --parallel
+
+./build-release/minikv_benchmark \
+  --workload read-miss --operations 5000 --keys 5000 --bloom on
+
+./bench/run_matrix.sh ./build-release/minikv_benchmark \
+  benchmark-results/matrix > benchmark-results/matrix.jsonl
+```
+
+The matrix covers sequential/random asynchronous writes, hit/miss reads,
+Bloom on/off, compacted/uncompacted reads, 50/50 and 95/5 read/write mixes,
+four-reader traffic, and a smaller strict-sync write run. Each result is one
+JSON object so repeated runs can be retained and compared without parsing
+human-oriented text.
+
+The metric boundaries are explicit:
+
+- `ops_per_second` and P50/P95/P99 cover timed user operations;
+- `end_to_end_ops_per_second` also includes the final write Flush, reported
+  separately as `maintenance_us`;
+- data blocks, tables, and bytes per read come from exact engine counters;
+- estimated write amplification is `(encoded WAL bytes + SSTable bytes) /
+  logical key/value bytes` for pure-write workloads only. It deliberately
+  excludes MANIFEST rewrites, filesystem metadata, and device-level writes;
+- space amplification is current SSTable, WAL, and MANIFEST bytes divided by
+  current logical key/value bytes.
+
+One Release run in the project virtual machine produced these illustrative
+results. They characterize this run, not other hardware and not RocksDB:
+
+| Workload/configuration | End-to-end ops/s | P50 us | Data blocks/read |
+| --- | ---: | ---: | ---: |
+| Sequential write, async | 66,193 | 2.900 | 0 |
+| Sequential write, strict | 2,406 | 368.502 | 0 |
+| Read hit, Bloom on, 16 L0 tables | 10,385 | 80.570 | 1.155 |
+| Read miss, Bloom on, 16 L0 tables | 66,838 | 1.615 | 0.156 |
+| Read miss, Bloom off, 16 L0 tables | 811 | 1,202.891 | 15.788 |
+| Read miss, Bloom on, compacted | 859,096 | 0.220 | 0.011 |
+| Parallel read hit, four threads | 36,364 | 78.404 | 1.156 |
+
+The measured optimization cycle targeted Bloom hashing. The two seeded FNV
+passes now traverse each key together and retain the exact old unsigned hash
+operations, finalization, and double-hash positions. Golden-format and Bloom
+tests retain the same 986/100,000 false positives, and the fixed 32-table miss
+fixture retained exactly 0.326 blocks and 1,311.253 bytes per read. Five
+100,000-operation before/after runs had median throughput of 31,879 and 31,893
+ops/s respectively, a 0.05% difference that is inside machine noise. The
+change removes duplicate key traversal, but V11 intentionally makes no
+end-to-end speedup claim from that result. Linux `perf` counters were
+unavailable in this virtual machine because `perf_event_paranoid` is 4; the
+project does not change host security policy to manufacture a profile.
+
 ## Build and test
 
 Requirements:
@@ -586,6 +659,51 @@ Inspect an SSTable without loading it into the database:
 
 Keys and values are printed as hexadecimal so arbitrary binary data remains
 unambiguous.
+
+## Install and consume
+
+Install the Release build into an isolated prefix, or generate a relocatable
+TGZ containing the same headers, static library, tools, and CMake package
+metadata:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --parallel
+cmake --install build-release --prefix "$PWD/minikv-prefix"
+
+cpack --config build-release/CPackConfig.cmake -G TGZ
+```
+
+An unrelated CMake project consumes only the installed package:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_embedded_store LANGUAGES CXX)
+
+find_package(MiniKV 1.0 CONFIG REQUIRED)
+
+add_executable(my_store main.cpp)
+target_link_libraries(my_store PRIVATE minikv::minikv)
+target_compile_features(my_store PRIVATE cxx_std_17)
+```
+
+Configure that consumer with the absolute install prefix:
+
+```bash
+cmake -S /path/to/my_store -B /path/to/my_store/build \
+  -DCMAKE_PREFIX_PATH=/absolute/path/to/minikv-prefix
+cmake --build /path/to/my_store/build --parallel
+```
+
+Normal non-sanitized `ctest` includes `install_smoke`. It installs MiniKV into
+a clean prefix, configures a separate consumer through `find_package`, links
+against `minikv::minikv`, performs Put/Get, closes, reopens, and verifies the
+persisted value. The consumer receives no source-tree include or library path.
+
+`MiniKV 1.0.0` is the semantic engine/package version. WAL, MANIFEST, SSTable,
+Bloom, continuation-token, and directory-storage versions are independent
+compatibility contracts and do not change merely because the package version
+changes.
 
 ## Architecture
 

@@ -18,18 +18,26 @@ Status BloomCorruption(std::string message) {
     return Status::Corruption("bloom filter: " + std::move(message));
 }
 
-std::uint64_t Hash64(std::string_view key, std::uint64_t seed) noexcept {
-    std::uint64_t hash = 14695981039346656037ULL ^ seed;
-    for (const unsigned char byte : key) {
-        hash ^= static_cast<std::uint64_t>(byte);
-        hash *= 1099511628211ULL;
-    }
+std::uint64_t FinalizeHash64(std::uint64_t hash) noexcept {
     hash ^= hash >> 33U;
     hash *= 0xff51afd7ed558ccdULL;
     hash ^= hash >> 33U;
     hash *= 0xc4ceb9fe1a85ec53ULL;
     hash ^= hash >> 33U;
     return hash;
+}
+
+std::array<std::uint64_t, 2> BloomHashes(std::string_view key) noexcept {
+    std::uint64_t first =
+        14695981039346656037ULL ^ 0x9e3779b97f4a7c15ULL;
+    std::uint64_t second =
+        14695981039346656037ULL ^ 0xd6e8feb86659fd93ULL;
+    for (const unsigned char byte : key) {
+        const std::uint64_t value = static_cast<std::uint64_t>(byte);
+        first = (first ^ value) * 1099511628211ULL;
+        second = (second ^ value) * 1099511628211ULL;
+    }
+    return {FinalizeHash64(first), FinalizeHash64(second)};
 }
 
 std::uint32_t ChecksumParts(
@@ -114,8 +122,9 @@ Status BloomFilter::Add(std::string_view key) {
     if (key_count_ == std::numeric_limits<std::uint64_t>::max()) {
         return Status::InvalidArgument("Bloom filter key count is exhausted");
     }
-    const std::uint64_t first = Hash64(key, 0x9e3779b97f4a7c15ULL);
-    std::uint64_t second = Hash64(key, 0xd6e8feb86659fd93ULL);
+    const auto hashes = BloomHashes(key);
+    const std::uint64_t first = hashes[0];
+    std::uint64_t second = hashes[1];
     second |= 1U;
     for (std::uint8_t index = 0; index < hash_count_; ++index) {
         const std::uint64_t bit =
@@ -131,8 +140,9 @@ bool BloomFilter::MayContain(std::string_view key) const noexcept {
     if (!FilterShapeIsValid(*this) || bit_count_ == 0 || key_count_ == 0) {
         return false;
     }
-    const std::uint64_t first = Hash64(key, 0x9e3779b97f4a7c15ULL);
-    std::uint64_t second = Hash64(key, 0xd6e8feb86659fd93ULL);
+    const auto hashes = BloomHashes(key);
+    const std::uint64_t first = hashes[0];
+    std::uint64_t second = hashes[1];
     second |= 1U;
     for (std::uint8_t index = 0; index < hash_count_; ++index) {
         const std::uint64_t bit =
