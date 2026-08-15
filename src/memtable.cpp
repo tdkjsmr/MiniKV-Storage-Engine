@@ -52,6 +52,15 @@ LookupResult MemTable::Get(std::string_view key) const {
     return result;
 }
 
+std::vector<MemTableRecord> MemTable::Records() const {
+    std::vector<MemTableRecord> records;
+    records.reserve(entries_.size());
+    for (const auto& [key, entry] : entries_) {
+        records.push_back({key, entry.sequence, entry.type, entry.value});
+    }
+    return records;
+}
+
 Status MemTable::Add(
     std::uint64_t sequence,
     ValueType type,

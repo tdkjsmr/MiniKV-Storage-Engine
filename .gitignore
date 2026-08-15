@@ -6,6 +6,8 @@
 /lib/
 /Testing/
 /compile_commands.json
+/_CPack_Packages/
+/MiniKV-*.tar.gz
 
 # Runtime database files
 /*.wal

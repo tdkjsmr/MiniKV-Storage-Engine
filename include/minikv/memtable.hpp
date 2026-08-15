@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "minikv/options.hpp"
 #include "minikv/status.hpp"
@@ -26,6 +27,13 @@ struct LookupResult {
     [[nodiscard]] bool deleted() const noexcept {
         return found() && type == ValueType::kDeletion;
     }
+};
+
+struct MemTableRecord {
+    std::string key;
+    std::uint64_t sequence = 0;
+    ValueType type = ValueType::kValue;
+    std::string value;
 };
 
 // V0 uses std::map deliberately: it keeps keys ordered and leaves the project
@@ -51,6 +59,7 @@ public:
     [[nodiscard]] std::size_t ApproximateDataSize() const noexcept {
         return approximate_data_size_;
     }
+    [[nodiscard]] std::vector<MemTableRecord> Records() const;
 
 private:
     struct Entry {

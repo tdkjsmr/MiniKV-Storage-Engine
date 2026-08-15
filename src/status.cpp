@@ -3,27 +3,28 @@
 #include <string_view>
 
 namespace minikv {
-namespace {
 
-std::string_view CodeName(StatusCode code) {
+std::string_view StatusCodeName(StatusCode code) noexcept {
     switch (code) {
         case StatusCode::kOk:
             return "OK";
         case StatusCode::kNotFound:
             return "NotFound";
+        case StatusCode::kIncomplete:
+            return "Incomplete";
         case StatusCode::kInvalidArgument:
             return "InvalidArgument";
         case StatusCode::kIOError:
             return "IOError";
         case StatusCode::kCorruption:
             return "Corruption";
+        case StatusCode::kVersionMismatch:
+            return "VersionMismatch";
         case StatusCode::kClosed:
             return "Closed";
     }
     return "Unknown";
 }
-
-}  // namespace
 
 Status Status::Ok() {
     return {};
@@ -31,6 +32,10 @@ Status Status::Ok() {
 
 Status Status::NotFound(std::string message) {
     return {StatusCode::kNotFound, std::move(message)};
+}
+
+Status Status::Incomplete(std::string message) {
+    return {StatusCode::kIncomplete, std::move(message)};
 }
 
 Status Status::InvalidArgument(std::string message) {
@@ -45,12 +50,16 @@ Status Status::Corruption(std::string message) {
     return {StatusCode::kCorruption, std::move(message)};
 }
 
+Status Status::VersionMismatch(std::string message) {
+    return {StatusCode::kVersionMismatch, std::move(message)};
+}
+
 Status Status::Closed(std::string message) {
     return {StatusCode::kClosed, std::move(message)};
 }
 
 std::string Status::ToString() const {
-    const std::string name(CodeName(code_));
+    const std::string name(StatusCodeName(code_));
     if (message_.empty()) {
         return name;
     }
