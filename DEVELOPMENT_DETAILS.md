@@ -679,6 +679,26 @@ cmake --install build-release --prefix "$PWD/minikv-prefix"
 cpack --config build-release/CPackConfig.cmake -G TGZ
 ```
 
+Tags matching `vMAJOR.MINOR.PATCH` trigger the dedicated Release workflow. It
+pins Ubuntu 22.04, requires an x86-64 runner, verifies that the tag matches the
+CMake project version, runs the full test suite, generates the TGZ, and tests
+an external consumer against the extracted archive. Only then does it publish
+the archive and `SHA256SUMS` to GitHub Releases.
+
+The v1.0.0 binary SDK can be downloaded without cloning the repository:
+
+```bash
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/minikv-1.0.0-linux-x86_64.tar.gz
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/SHA256SUMS
+sha256sum --check SHA256SUMS
+tar -xzf minikv-1.0.0-linux-x86_64.tar.gz
+```
+
+This SDK contains a static C++ library rather than a universal standalone
+application. Consumers still require a C++17 compiler and CMake, and the
+prebuilt objects and tools require Linux, glibc, and libstdc++ compatibility
+with the Ubuntu 22.04 build baseline.
+
 An unrelated CMake project consumes only the installed package:
 
 ```cmake
@@ -703,7 +723,9 @@ cmake --build /path/to/my_store/build --parallel
 Normal non-sanitized `ctest` includes `install_smoke`. It installs MiniKV into
 a clean prefix, configures a separate consumer through `find_package`, links
 against `minikv::minikv`, performs Put/Get, closes, reopens, and verifies the
-persisted value. The consumer receives no source-tree include or library path.
+persisted value. The release-only `package_smoke.cmake` repeats that contract
+against the extracted TGZ. Neither consumer receives a source-tree include or
+library path.
 
 `MiniKV 1.0.0` is the semantic engine/package version. WAL, MANIFEST, SSTable,
 Bloom, continuation-token, and directory-storage versions are independent

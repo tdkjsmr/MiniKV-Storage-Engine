@@ -29,7 +29,30 @@ benchmark methodology, and the V0–V11 roadmap, see
 - CMake 3.16 or newer
 - a C++17 compiler such as GCC 9 or newer
 
-## Build and test
+## Download a prebuilt package
+
+The GitHub Release provides a Linux x86-64 SDK that can be used without
+cloning this repository:
+
+```bash
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/minikv-1.0.0-linux-x86_64.tar.gz
+curl -LO https://github.com/tdkjsmr/MiniKV-Storage-Engine/releases/download/v1.0.0/SHA256SUMS
+sha256sum --check SHA256SUMS
+tar -xzf minikv-1.0.0-linux-x86_64.tar.gz
+```
+
+Use the extracted directory as the CMake prefix:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=/absolute/path/to/minikv-1.0.0-linux-x86_64
+```
+
+The package is built on Ubuntu 22.04 and contains a static C++ library, headers,
+tools, and CMake metadata. Consumers still need a C++17 toolchain and compatible
+Linux, glibc, and libstdc++ runtimes.
+
+## Build and test from source
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -41,7 +64,7 @@ The normal test suite includes a package-install smoke test. ASan and UBSan
 can be enabled with `MINIKV_ENABLE_ASAN` and `MINIKV_ENABLE_UBSAN` in separate
 build directories.
 
-## Install
+## Install from source
 
 Install into a local prefix without changing the host system:
 
